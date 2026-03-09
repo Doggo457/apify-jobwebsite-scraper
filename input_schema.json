@@ -1,0 +1,88 @@
+{
+    "title": "UK Jobs Board Scraper Input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "keyword": {
+            "title": "Job Keyword",
+            "type": "string",
+            "description": "Search keyword (e.g. 'software engineer', 'data analyst', 'nurse')",
+            "editor": "textfield",
+            "prefill": "software engineer"
+        },
+        "location": {
+            "title": "Location",
+            "type": "string",
+            "description": "Location to search in (e.g. 'London', 'Manchester', 'Edinburgh')",
+            "editor": "textfield",
+            "prefill": "London"
+        },
+        "max_results": {
+            "title": "Max Results",
+            "type": "integer",
+            "description": "Maximum total job listings to return (spread across all boards)",
+            "default": 50,
+            "minimum": 1,
+            "maximum": 1000
+        },
+        "salary_min": {
+            "title": "Minimum Salary",
+            "type": "integer",
+            "description": "Minimum salary filter (optional, annual GBP)",
+            "editor": "textfield",
+            "nullable": true
+        },
+        "job_type": {
+            "title": "Job Type",
+            "type": "string",
+            "description": "Filter by job type",
+            "editor": "select",
+            "default": "all",
+            "enum": ["all", "permanent", "temporary", "contract", "part-time"],
+            "enumTitles": ["All", "Permanent", "Temporary", "Contract", "Part-time"]
+        },
+        "boards": {
+            "title": "Job Boards to Scrape",
+            "type": "array",
+            "description": "Select which UK job boards to scrape. Leave empty for all boards.",
+            "default": ["reed", "totaljobs", "cvlibrary", "cwjobs", "indeed", "findajob", "adzuna"],
+            "items": {
+                "type": "string",
+                "enum": ["reed", "totaljobs", "cvlibrary", "cwjobs", "indeed", "findajob", "adzuna"],
+                "enumTitles": [
+                    "Reed.co.uk",
+                    "Totaljobs.com",
+                    "CV-Library.co.uk",
+                    "CWJobs.co.uk (IT/Tech)",
+                    "Indeed UK",
+                    "GOV.UK Find a Job",
+                    "Adzuna (needs API key)"
+                ]
+            }
+        },
+        "deduplicate": {
+            "title": "Remove Duplicates",
+            "type": "boolean",
+            "description": "Remove duplicate jobs that appear on multiple boards",
+            "default": true
+        },
+        "adzuna_app_id": {
+            "title": "Adzuna App ID",
+            "type": "string",
+            "description": "Optional: Adzuna API App ID (free at https://developer.adzuna.com)",
+            "editor": "textfield",
+            "nullable": true,
+            "sectionCaption": "Adzuna API (Optional)",
+            "sectionDescription": "Register for free API keys at https://developer.adzuna.com to enable Adzuna scraping"
+        },
+        "adzuna_app_key": {
+            "title": "Adzuna App Key",
+            "type": "string",
+            "description": "Optional: Adzuna API App Key",
+            "editor": "textfield",
+            "nullable": true,
+            "isSecret": true
+        }
+    },
+    "required": ["keyword", "location"]
+}
