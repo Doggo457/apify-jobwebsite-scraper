@@ -22,6 +22,10 @@ JOB_TYPE_MAP = {
 
 class TotaljobsScraper(BaseScraper):
 
+    def __init__(self, client, delay: float = 1.5, **kwargs):
+        super().__init__(client, delay, **kwargs)
+        self.fetch_details = False
+
     @property
     def source_name(self) -> str:
         return "totaljobs.com"
@@ -53,7 +57,7 @@ class TotaljobsScraper(BaseScraper):
             url = self._build_url(keyword, location, job_type, salary_min, page)
             Actor.log.info(f"[Totaljobs] Scraping page {page}: {url}")
 
-            html = await self._fetch(url)
+            html = await self._get_html(url)
             if not html:
                 break
 
@@ -65,6 +69,16 @@ class TotaljobsScraper(BaseScraper):
             for job in jobs:
                 if len(all_jobs) >= max_results:
                     break
+
+                # Fetch detail page for complete data
+                if self.fetch_details and job.get("url"):
+                    detail = await self._parse_detail(job["url"])
+                    # Only update fields that are missing
+                    for k, v in detail.items():
+                        if v and not job.get(k):
+                            job[k] = v
+                    await self._polite_delay()
+
                 all_jobs.append(job)
 
             if not has_next or len(all_jobs) >= max_results:
@@ -75,6 +89,51 @@ class TotaljobsScraper(BaseScraper):
 
         Actor.log.info(f"[Totaljobs] Total scraped: {len(all_jobs)}")
         return all_jobs
+
+    async def _parse_detail(self, url: str) -> dict:
+        """Fetch a detail page and extract structured data."""
+        html = await self._get_html(url)
+        if not html:
+            return {}
+
+        # Try JSON-LD first
+        jsonld_jobs = self._extract_jsonld_jobs(html)
+        if jsonld_jobs:
+            return jsonld_jobs[0]
+
+        soup = BeautifulSoup(html, "html.parser")
+        details = {}
+
+        for sel in ['[class*="description"]', '[itemprop="description"]', "#job-description"]:
+            el = soup.select_one(sel)
+            if el and len(el.get_text(strip=True)) > 50:
+                details["full_description"] = el.get_text(separator="\n", strip=True)
+                details["snippet"] = clean_text(el.get_text())[:500]
+                break
+
+        for sel in ['[class*="company"]', '[itemprop="hiringOrganization"]']:
+            el = soup.select_one(sel)
+            if el:
+                details["company"] = clean_text(el.get_text())
+                break
+
+        for sel in ['[class*="location"]', '[itemprop="jobLocation"]']:
+            el = soup.select_one(sel)
+            if el:
+                details["location"] = clean_text(el.get_text())
+                break
+
+        for sel in ['[class*="salary"]', '[itemprop="baseSalary"]']:
+            el = soup.select_one(sel)
+            if el:
+                sal = parse_salary(el.get_text())
+                details["salary_raw"] = sal["raw"]
+                details["salary_min"] = sal["min"]
+                details["salary_max"] = sal["max"]
+                details["salary_period"] = sal["period"]
+                break
+
+        return details
 
     def _parse_search(self, html: str) -> tuple[list[dict], bool]:
         # Try JSON-LD first (most reliable for JS-rendered sites)

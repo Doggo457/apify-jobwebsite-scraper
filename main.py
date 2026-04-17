@@ -1,43 +1,100 @@
 """
-UK Jobs Board Scraper - Multi-Board Aggregator
-Scrapes job listings from multiple UK job boards with unified output format.
+International Jobs Board Scraper - Multi-Board Aggregator
+Scrapes job listings from UK, US, EU and remote job boards with unified output.
 
 Supported boards:
-  - Reed.co.uk
-  - Totaljobs.com
-  - CV-Library.co.uk
-  - CWJobs.co.uk (IT/Tech)
-  - Indeed UK
-  - GOV.UK Find a Job
-  - Adzuna (via API - requires free API key)
+  UK:     Reed, Totaljobs, CV-Library, CWJobs, Indeed UK, GOV.UK Find a Job
+  US:     USAJobs, Indeed US
+  EU:     Indeed DE/FR/NL, Arbeitnow
+  Global: Adzuna (multi-country API), RemoteOK
 """
 
 import asyncio
 import os
+import random
+import re
+import statistics
 
 import httpx
 from apify import Actor
+from playwright.async_api import async_playwright
 
 from .utils import make_headers
 from .boards.reed import ReedScraper
 from .boards.totaljobs import TotaljobsScraper
 from .boards.cvlibrary import CVLibraryScraper
 from .boards.cwjobs import CWJobsScraper
-from .boards.indeed import IndeedUKScraper
+from .boards.indeed import IndeedUKScraper, IndeedScraper
 from .boards.findajob import FindAJobScraper
 from .boards.adzuna import AdzunaScraper
+from .boards.usajobs import USAJobsScraper
+from .boards.remoteok import RemoteOKScraper
+from .boards.arbeitnow import ArbeitnowScraper
 
 
 # Map board names to scraper classes
 BOARD_REGISTRY = {
+    # UK boards
     "reed": ReedScraper,
     "totaljobs": TotaljobsScraper,
     "cvlibrary": CVLibraryScraper,
     "cwjobs": CWJobsScraper,
     "indeed": IndeedUKScraper,
     "findajob": FindAJobScraper,
-    # Adzuna handled separately (needs API keys)
+    # US boards
+    "usajobs": USAJobsScraper,
+    "indeed_us": lambda client, **kw: IndeedScraper(client, base_url="https://www.indeed.com", source="indeed.com", **kw),
+    # EU boards
+    "indeed_de": lambda client, **kw: IndeedScraper(client, base_url="https://de.indeed.com", source="indeed.de", **kw),
+    "indeed_fr": lambda client, **kw: IndeedScraper(client, base_url="https://fr.indeed.com", source="indeed.fr", **kw),
+    "indeed_nl": lambda client, **kw: IndeedScraper(client, base_url="https://nl.indeed.com", source="indeed.nl", **kw),
+    "indeed_au": lambda client, **kw: IndeedScraper(client, base_url="https://au.indeed.com", source="indeed.au", **kw),
+    # Remote / global
+    "remoteok": RemoteOKScraper,
+    "arbeitnow": ArbeitnowScraper,
+    # Adzuna handled separately (needs API keys + country config)
 }
+
+# Boards that REQUIRE Playwright browser rendering (JS-heavy, anti-bot)
+BROWSER_BOARDS = {"totaljobs", "cwjobs", "cvlibrary", "indeed",
+                  "indeed_us", "indeed_de", "indeed_fr", "indeed_nl", "indeed_au"}
+
+# HTTP-only boards (no browser needed, or gov.uk blocks proxies)
+HTTP_ONLY_BOARDS = {"reed", "findajob", "usajobs", "remoteok", "arbeitnow", "adzuna"}
+
+# Default boards per country
+COUNTRY_DEFAULTS = {
+    "uk": ["reed", "totaljobs", "cvlibrary", "cwjobs", "indeed", "findajob", "adzuna"],
+    "us": ["usajobs", "indeed_us", "adzuna", "remoteok"],
+    "de": ["indeed_de", "adzuna", "arbeitnow"],
+    "fr": ["indeed_fr", "adzuna"],
+    "nl": ["indeed_nl", "adzuna"],
+    "au": ["indeed_au", "adzuna"],
+    "remote": ["remoteok", "arbeitnow", "adzuna"],
+}
+
+# Adzuna country code mapping
+ADZUNA_COUNTRY_MAP = {
+    "uk": "gb", "us": "us", "de": "de", "fr": "fr",
+    "nl": "nl", "au": "au", "remote": "gb",
+}
+
+# Playwright browser launch args for stealth
+STEALTH_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--disable-infobars",
+    "--disable-background-networking",
+    "--disable-default-apps",
+    "--disable-extensions",
+    "--disable-sync",
+    "--disable-translate",
+    "--no-first-run",
+    "--ignore-certificate-errors",
+    "--window-size=1920,1080",
+]
 
 
 async def run_board(scraper, keyword, location, max_per_board, job_type, salary_min) -> list[dict]:
@@ -53,6 +110,38 @@ async def run_board(scraper, keyword, location, max_per_board, job_type, salary_
     except Exception as e:
         Actor.log.error(f"[{scraper.source_name}] Scraper failed: {e}")
         return []
+
+
+def normalize_job(job: dict) -> dict:
+    """Ensure all job dicts have every expected field (no undefined in output)."""
+    defaults = {
+        "title": "",
+        "company": "",
+        "location": "",
+        "salary_raw": "",
+        "salary_min": None,
+        "salary_max": None,
+        "salary_currency": "GBP",
+        "salary_period": "",
+        "snippet": "",
+        "full_description": "",
+        "employment_type": "",
+        "date_posted": "",
+        "valid_through": "",
+        "url": "",
+        "job_id": "",
+        "source": "",
+        "category": "",
+    }
+    normalized = {**defaults, **{k: v for k, v in job.items() if v is not None and v != ""}}
+    # Ensure None values don't override defaults for string fields
+    for key in ["title", "company", "location", "salary_raw", "snippet",
+                "full_description", "employment_type", "date_posted",
+                "valid_through", "url", "job_id", "source", "category",
+                "salary_period", "salary_currency"]:
+        if normalized.get(key) is None:
+            normalized[key] = defaults[key]
+    return normalized
 
 
 def deduplicate_jobs(jobs: list[dict]) -> list[dict]:
@@ -78,19 +167,84 @@ def deduplicate_jobs(jobs: list[dict]) -> list[dict]:
     return unique
 
 
+def compute_salary_benchmarks(jobs: list[dict]) -> list[dict]:
+    """Compute salary benchmarks grouped by title keyword and location."""
+    from collections import defaultdict
+
+    # Group salaries by normalised title + location
+    buckets = defaultdict(list)
+    for job in jobs:
+        sal_min = job.get("salary_min")
+        sal_max = job.get("salary_max")
+        period = job.get("salary_period", "annum")
+
+        # Only use annual salaries for benchmarking
+        if not sal_min and not sal_max:
+            continue
+
+        # Rough annualisation
+        mid = ((sal_min or sal_max) + (sal_max or sal_min)) / 2
+        if period == "day":
+            mid *= 220
+        elif period == "hour":
+            mid *= 1760
+        elif period == "month":
+            mid *= 12
+        elif period == "week":
+            mid *= 52
+
+        if mid < 5000 or mid > 500000:
+            continue  # filter outliers
+
+        title = job.get("title", "").lower().strip()
+        location = job.get("location", "").lower().strip()
+        # Use first meaningful word of location
+        loc_key = location.split(",")[0].strip() if location else "unknown"
+        buckets[(title, loc_key)].append(mid)
+
+    benchmarks = []
+    for (title, loc), salaries in buckets.items():
+        if len(salaries) < 2:
+            continue
+        salaries.sort()
+        benchmarks.append({
+            "benchmark_title": title,
+            "benchmark_location": loc,
+            "count": len(salaries),
+            "salary_mean": round(statistics.mean(salaries)),
+            "salary_median": round(statistics.median(salaries)),
+            "salary_p25": round(salaries[len(salaries) // 4]),
+            "salary_p75": round(salaries[(len(salaries) * 3) // 4]),
+            "salary_min": round(min(salaries)),
+            "salary_max": round(max(salaries)),
+            "_type": "salary_benchmark",
+        })
+
+    return sorted(benchmarks, key=lambda b: b["count"], reverse=True)
+
+
 async def main() -> None:
     async with Actor:
         # ─── Read Input ────────────────────────────────────────────────
         actor_input = await Actor.get_input() or {}
 
-        keyword = actor_input.get("keyword", "software engineer")
-        location = actor_input.get("location", "London")
-        max_results = actor_input.get("max_results", 50)
-        salary_min = actor_input.get("salary_min")
-        job_type = actor_input.get("job_type", "all")
+        # Custom fields override presets when filled in
+        keyword = actor_input.get("custom_keyword") or actor_input.get("keyword", "software engineer")
+        if keyword == "__custom__":
+            keyword = actor_input.get("custom_keyword", "software engineer")
+        location = actor_input.get("custom_location") or actor_input.get("location", "London")
+        if location == "__custom__":
+            location = actor_input.get("custom_location", "London")
 
-        # Board selection - defaults to all boards
-        selected_boards = actor_input.get("boards", list(BOARD_REGISTRY.keys()) + ["adzuna"])
+        max_results = actor_input.get("max_results", 50)
+        salary_min = actor_input.get("salary_min") or None
+        job_type = actor_input.get("job_type", "all")
+        fetch_details = actor_input.get("fetch_details", True)
+        country = actor_input.get("country", "uk")
+        salary_benchmark = actor_input.get("salary_benchmark", False)
+
+        # Board selection - use country defaults if empty/not specified
+        selected_boards = actor_input.get("boards") or COUNTRY_DEFAULTS.get(country, COUNTRY_DEFAULTS["uk"])
 
         # Adzuna API credentials (optional)
         adzuna_app_id = actor_input.get("adzuna_app_id", "")
@@ -99,88 +253,193 @@ async def main() -> None:
         # Deduplication toggle
         deduplicate = actor_input.get("deduplicate", True)
 
-        Actor.log.info(f"Starting multi-board scrape: '{keyword}' in '{location}'")
+        Actor.log.info(f"Starting multi-board scrape: '{keyword}' in '{location}' (country={country})")
         Actor.log.info(f"Boards: {selected_boards}")
-        Actor.log.info(f"Max results: {max_results} | Job type: {job_type}")
+        Actor.log.info(f"Max results: {max_results or 'unlimited'} | Job type: {job_type} | Details: {fetch_details}")
 
         # ─── Calculate per-board limits ────────────────────────────────
         num_boards = len(selected_boards)
-        # Give each board an equal share, with some extra to account for dedup
-        max_per_board = max(10, (max_results * 2) // num_boards) if num_boards > 0 else max_results
+        if max_results == 0:
+            max_per_board = 10000
+        else:
+            max_per_board = max(10, (max_results * 2) // num_boards) if num_boards > 0 else max_results
 
-        # ─── Create HTTP client with Apify proxy ──────────────────────
+        # ─── Create HTTP client (NO proxy — browser handles proxied requests) ──
         headers = make_headers()
-
-        # Use Apify proxy when running on the platform
-        proxy_url = None
-        is_on_apify = os.environ.get("APIFY_IS_AT_HOME", "0") == "1"
-
-        if is_on_apify:
-            proxy_config = await Actor.create_proxy_configuration(
-                groups=["RESIDENTIAL"],
-                country_code="GB",
-            )
-            if proxy_config:
-                proxy_url = await proxy_config.new_url()
-                Actor.log.info(f"Using Apify residential proxy (GB)")
 
         async with httpx.AsyncClient(
             headers=headers,
-            timeout=60.0,
-            proxy=proxy_url,
+            timeout=30.0,
         ) as client:
-            # ─── Initialise scrapers ───────────────────────────────────
-            scrapers = []
 
-            for board_name in selected_boards:
-                if board_name == "adzuna":
-                    scraper = AdzunaScraper(
-                        client,
-                        delay=0.5,
-                        app_id=adzuna_app_id,
-                        app_key=adzuna_app_key,
+            # ─── Set up Apify proxy config ────────────────────────────
+            proxy_config = None
+            is_on_apify = os.environ.get("APIFY_IS_AT_HOME", "0") == "1"
+            need_browser = any(b in BROWSER_BOARDS for b in selected_boards)
+
+            if is_on_apify:
+                proxy_country = ADZUNA_COUNTRY_MAP.get(country, "GB").upper()
+                try:
+                    proxy_config = await Actor.create_proxy_configuration(
+                        groups=["RESIDENTIAL"],
+                        country_code=proxy_country,
                     )
-                    scrapers.append(scraper)
-                elif board_name in BOARD_REGISTRY:
-                    scraper = BOARD_REGISTRY[board_name](client, delay=1.5)
-                    scrapers.append(scraper)
-                else:
-                    Actor.log.warning(f"Unknown board: {board_name}, skipping.")
+                    Actor.log.info(f"Using Apify residential proxy ({proxy_country})")
+                except Exception as e:
+                    Actor.log.warning(f"Proxy config failed: {e}")
 
-            if not scrapers:
-                Actor.log.error("No valid boards selected!")
-                return
+            # ─── Launch Playwright browser if needed ──────────────────
+            browser = None
+            playwright_instance = None
 
-            # ─── Run all scrapers ──────────────────────────────────────
-            # Run scrapers sequentially to be respectful with rate limits
-            # (could be parallelised with asyncio.gather for speed)
-            all_jobs = []
+            if need_browser:
+                Actor.log.info("Launching Playwright browser for JS-heavy boards...")
+                try:
+                    playwright_instance = await async_playwright().start()
 
-            for scraper in scrapers:
-                Actor.log.info(f"═══ Starting {scraper.source_name} ═══")
-                jobs = await run_board(
-                    scraper, keyword, location, max_per_board, job_type, salary_min
-                )
-                all_jobs.extend(jobs)
-                Actor.log.info(f"═══ {scraper.source_name} returned {len(jobs)} jobs ═══")
+                    # Chromium requires browser-level proxy for context-level proxy to work
+                    # Use a placeholder so per-context proxy overrides are allowed
+                    launch_kwargs = {
+                        "headless": True,
+                        "args": STEALTH_ARGS,
+                    }
+                    if proxy_config:
+                        # Get an initial proxy URL to set at browser level
+                        initial_proxy_url = await proxy_config.new_url(
+                            session_id=f"browser_init_{random.randint(1000, 9999)}"
+                        )
+                        from urllib.parse import urlparse
+                        parsed = urlparse(initial_proxy_url)
+                        launch_kwargs["proxy"] = {
+                            "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+                            "username": parsed.username or "",
+                            "password": parsed.password or "",
+                        }
+                        Actor.log.info(f"Browser launched with proxy: {parsed.hostname}:{parsed.port}")
 
-            # ─── Deduplicate ───────────────────────────────────────────
-            if deduplicate:
-                before_count = len(all_jobs)
-                all_jobs = deduplicate_jobs(all_jobs)
-                removed = before_count - len(all_jobs)
-                if removed > 0:
-                    Actor.log.info(f"Deduplication removed {removed} duplicates")
+                    browser = await playwright_instance.chromium.launch(**launch_kwargs)
+                    Actor.log.info("Playwright browser launched successfully")
+                except Exception as e:
+                    Actor.log.error(f"Failed to launch Playwright: {e}")
+                    Actor.log.warning("Browser boards will fall back to httpx (may return fewer results)")
 
-            # ─── Trim to max results ───────────────────────────────────
-            all_jobs = all_jobs[:max_results]
+            try:
+                # ─── Initialise scrapers (split browser vs API) ───────
+                browser_scrapers = []
+                api_scrapers = []
+                adzuna_country = ADZUNA_COUNTRY_MAP.get(country, "gb")
 
-            # ─── Push results ──────────────────────────────────────────
-            for job in all_jobs:
-                await Actor.push_data(job)
+                for board_name in selected_boards:
+                    if board_name == "adzuna":
+                        scraper = AdzunaScraper(
+                            client,
+                            delay=0.5,
+                            app_id=adzuna_app_id,
+                            app_key=adzuna_app_key,
+                            country=adzuna_country,
+                        )
+                        api_scrapers.append(scraper)
+
+                    elif board_name in BOARD_REGISTRY:
+                        factory = BOARD_REGISTRY[board_name]
+
+                        if board_name in BROWSER_BOARDS and browser and proxy_config:
+                            # Sanitize board name for session ID (only [\w._~] allowed)
+                            safe_name = re.sub(r"[^a-zA-Z0-9._~]", "_", board_name)
+                            proxy_url = await proxy_config.new_url(
+                                session_id=f"jobs_{safe_name}_{random.randint(1000, 9999)}"
+                            )
+                            if callable(factory) and not isinstance(factory, type):
+                                scraper = factory(client, delay=1.5, browser=browser,
+                                                  proxy_url=proxy_url, proxy_config=proxy_config)
+                            else:
+                                scraper = factory(client, delay=1.5, browser=browser,
+                                                  proxy_url=proxy_url, proxy_config=proxy_config)
+                            browser_scrapers.append(scraper)
+                        elif board_name in BROWSER_BOARDS and browser:
+                            if callable(factory) and not isinstance(factory, type):
+                                scraper = factory(client, delay=1.5, browser=browser)
+                            else:
+                                scraper = factory(client, delay=1.5, browser=browser)
+                            browser_scrapers.append(scraper)
+                        else:
+                            if callable(factory) and not isinstance(factory, type):
+                                scraper = factory(client, delay=0.5)
+                            else:
+                                scraper = factory(client, delay=0.5)
+                            api_scrapers.append(scraper)
+
+                        # Pass fetch_details to scrapers that support it
+                        if hasattr(scraper, "fetch_details"):
+                            scraper.fetch_details = fetch_details
+                    else:
+                        Actor.log.warning(f"Unknown board: {board_name}, skipping.")
+
+                all_scrapers = api_scrapers + browser_scrapers
+                if not all_scrapers:
+                    Actor.log.error("No valid boards selected!")
+                    return
+
+                all_jobs = []
+
+                # ─── Run API scrapers in parallel (fast, no browser) ──
+                if api_scrapers:
+                    Actor.log.info(f"Running {len(api_scrapers)} API scrapers in parallel...")
+                    api_results = await asyncio.gather(
+                        *[run_board(s, keyword, location, max_per_board, job_type, salary_min)
+                          for s in api_scrapers],
+                    )
+                    for scraper, jobs in zip(api_scrapers, api_results):
+                        Actor.log.info(f"═══ {scraper.source_name} returned {len(jobs)} jobs ═══")
+                        all_jobs.extend(jobs)
+
+                # ─── Run browser scrapers one at a time (sequential) ──
+                if browser_scrapers:
+                    Actor.log.info(f"Running {len(browser_scrapers)} browser scrapers sequentially...")
+                    for scraper in browser_scrapers:
+                        Actor.log.info(f"── Starting {scraper.source_name} ──")
+                        jobs = await run_board(scraper, keyword, location, max_per_board, job_type, salary_min)
+                        Actor.log.info(f"═══ {scraper.source_name} returned {len(jobs)} jobs ═══")
+                        all_jobs.extend(jobs)
+
+                # ─── Deduplicate ──────────────────────────────────────
+                if deduplicate:
+                    before_count = len(all_jobs)
+                    all_jobs = deduplicate_jobs(all_jobs)
+                    removed = before_count - len(all_jobs)
+                    if removed > 0:
+                        Actor.log.info(f"Deduplication removed {removed} duplicates")
+
+                # ─── Trim to max results (0 = unlimited) ─────────────
+                if max_results > 0:
+                    all_jobs = all_jobs[:max_results]
+
+                # ─── Normalize and push results ───────────────────────
+                all_jobs = [normalize_job(job) for job in all_jobs]
+                for job in all_jobs:
+                    await Actor.push_data(job)
+
+                # ─── Salary benchmarks ────────────────────────────────
+                if salary_benchmark:
+                    benchmarks = compute_salary_benchmarks(all_jobs)
+                    Actor.log.info(f"Generated {len(benchmarks)} salary benchmarks")
+                    for b in benchmarks:
+                        await Actor.push_data(b)
+
+            finally:
+                # ─── Clean up browser ─────────────────────────────────
+                if browser:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+                if playwright_instance:
+                    try:
+                        await playwright_instance.stop()
+                    except Exception:
+                        pass
 
         # ─── Summary ──────────────────────────────────────────────────
-        # Count per source
         source_counts = {}
         for job in all_jobs:
             src = job.get("source", "unknown")

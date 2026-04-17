@@ -3,10 +3,11 @@
 import re
 from urllib.parse import quote_plus, urljoin
 
+import httpx
 from apify import Actor
 from bs4 import BeautifulSoup
 
-from ..utils import BaseScraper, parse_salary, clean_text
+from ..utils import BaseScraper, parse_salary, clean_text, make_headers
 
 BASE_URL = "https://findajob.dwp.gov.uk"
 
@@ -22,8 +23,13 @@ JOB_TYPE_MAP = {
 class FindAJobScraper(BaseScraper):
     """
     GOV.UK Find a Job service scraper.
-    Uses plain HTTP - gov.uk blocks proxy tunnels (ERR_TUNNEL_CONNECTION_FAILED).
+    Uses a direct (non-proxied) connection since the gov.uk site
+    blocks proxy traffic but allows direct requests.
     """
+
+    def __init__(self, client, delay: float = 1.5, **kwargs):
+        super().__init__(client, delay, **kwargs)
+        self.fetch_details = False  # Set by main.py, saves ~50% requests
 
     @property
     def source_name(self) -> str:
@@ -53,6 +59,20 @@ class FindAJobScraper(BaseScraper):
 
         return f"{BASE_URL}/search?" + "&".join(params)
 
+    async def _fetch_direct(self, url: str) -> str | None:
+        """Fetch without proxy - gov.uk blocks proxy traffic."""
+        try:
+            async with httpx.AsyncClient(
+                headers=make_headers(),
+                timeout=30.0,
+            ) as direct_client:
+                response = await direct_client.get(url, follow_redirects=True)
+                response.raise_for_status()
+                return response.text
+        except httpx.HTTPError as e:
+            Actor.log.warning(f"[{self.source_name}] Failed to fetch {url}: {e}")
+            return None
+
     async def search(self, keyword: str, location: str, max_results: int = 50,
                      job_type: str = "all", salary_min: int | None = None) -> list[dict]:
         all_jobs = []
@@ -62,16 +82,12 @@ class FindAJobScraper(BaseScraper):
             url = self._build_url(keyword, location, job_type, salary_min, page)
             Actor.log.info(f"[FindAJob] Scraping page {page}: {url}")
 
-            # Use plain HTTP - gov.uk doesn't need browser and blocks proxies
-            html = await self._fetch(url)
+            # Try direct first (gov.uk blocks proxies), fall back to proxied/browser
+            html = await self._fetch_direct(url)
             if not html:
-                # Fallback to browser without proxy if available
-                if self.browser:
-                    Actor.log.info("[FindAJob] HTTP failed, trying browser without proxy...")
-                    html = await self._fetch_browser_no_proxy(url, wait_selector='a[href*="/details/"], div[class*="search-result"]')
-                if not html:
-                    Actor.log.warning("[FindAJob] Failed to fetch page")
-                    break
+                html = await self._get_html(url)
+            if not html:
+                break
 
             jobs, has_next = self._parse_search(html)
             if not jobs:
@@ -82,12 +98,20 @@ class FindAJobScraper(BaseScraper):
                 if len(all_jobs) >= max_results:
                     break
 
-                if job.get("url"):
-                    # Detail pages also use plain HTTP
-                    detail_html = await self._fetch(job["url"])
+                # Fetch detail page only if enabled (expensive: 1 request per job)
+                if self.fetch_details and job.get("url"):
+                    detail_html = await self._fetch_direct(job["url"])
                     if detail_html:
-                        detail = self._parse_detail_html(detail_html)
-                        job.update(detail)
+                        # Try JSON-LD first (most complete data)
+                        jsonld_jobs = self._extract_jsonld_jobs(detail_html)
+                        if jsonld_jobs:
+                            detail = jsonld_jobs[0]
+                        else:
+                            detail = self._parse_detail_html(detail_html)
+                        # Only fill missing fields
+                        for k, v in detail.items():
+                            if v and not job.get(k):
+                                job[k] = v
                     await self._polite_delay()
 
                 all_jobs.append(job)
@@ -100,32 +124,6 @@ class FindAJobScraper(BaseScraper):
 
         Actor.log.info(f"[FindAJob] Total scraped: {len(all_jobs)}")
         return all_jobs
-
-    async def _fetch_browser_no_proxy(self, url: str, wait_selector: str = "body") -> str | None:
-        """Fetch with browser but WITHOUT proxy (for gov.uk which blocks tunnels)."""
-        if not self.browser:
-            return None
-        try:
-            context = await self.browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080},
-                locale="en-GB",
-                timezone_id="Europe/London",
-            )
-            try:
-                await context.add_init_script(self.STEALTH_JS)
-                page = await context.new_page()
-                await page.goto(url, wait_until="load", timeout=20000)
-                try:
-                    await page.wait_for_selector(wait_selector, timeout=5000)
-                except Exception:
-                    pass
-                return await page.content()
-            finally:
-                await context.close()
-        except Exception as e:
-            Actor.log.warning(f"[FindAJob] Browser (no proxy) failed: {e}")
-            return None
 
     def _parse_search(self, html: str) -> tuple[list[dict], bool]:
         # Try JSON-LD first
@@ -198,6 +196,50 @@ class FindAJobScraper(BaseScraper):
             if el:
                 job["date_posted"] = el.get("datetime", clean_text(el.get_text()))
 
+            # ── Text-based fallbacks from card/snippet text ──
+            card_text = clean_text(card.get_text())
+
+            # Try to extract salary from snippet/card text
+            if not job.get("salary_raw"):
+                sal = self._extract_salary_from_text(card_text)
+                if sal and (sal.get("min") or sal.get("max")):
+                    job["salary_raw"] = sal["raw"]
+                    job["salary_min"] = sal["min"]
+                    job["salary_max"] = sal["max"]
+                    job["salary_period"] = sal["period"]
+
+            # Location from card text
+            if not job.get("location"):
+                loc_match = re.search(
+                    r'\b(London|Manchester|Birmingham|Leeds|Bristol|Liverpool|'
+                    r'Sheffield|Glasgow|Edinburgh|Cardiff|Newcastle|Nottingham|'
+                    r'Southampton|Oxford|Cambridge|Reading|Brighton|'
+                    r'West London|East London|Central London|Remote|Hybrid'
+                    r'|[A-Z]{1,2}\d{1,2}\s*\d[A-Z]{2})\b',
+                    card_text, re.IGNORECASE
+                )
+                if loc_match:
+                    job["location"] = loc_match.group(0).strip()
+
+            # Employment type from card text
+            if not job.get("employment_type"):
+                emp_match = re.search(
+                    r'\b(permanent|contract|temporary|part[\s-]?time|full[\s-]?time|'
+                    r'fixed[\s-]?term|freelance|apprenticeship)\b',
+                    card_text, re.IGNORECASE
+                )
+                if emp_match:
+                    job["employment_type"] = emp_match.group(1).strip().title()
+
+            # Date from card text
+            if not job.get("date_posted"):
+                date_match = re.search(
+                    r'\b(\d+\s*(?:day|hour|week|month)s?\s*ago|today|yesterday)\b',
+                    card_text, re.IGNORECASE
+                )
+                if date_match:
+                    job["date_posted"] = date_match.group(1).strip()
+
             if job.get("title"):
                 jobs.append(job)
 
@@ -211,6 +253,7 @@ class FindAJobScraper(BaseScraper):
         soup = BeautifulSoup(html, "html.parser")
         details = {}
 
+        # Description
         el = (
             soup.select_one('[class*="vacancy-description"]')
             or soup.select_one('[class*="job-description"]')
@@ -218,13 +261,76 @@ class FindAJobScraper(BaseScraper):
         )
         if el:
             details["full_description"] = el.get_text(separator="\n", strip=True)
+            if not details.get("snippet"):
+                details["snippet"] = clean_text(el.get_text())[:500]
 
+        # Company / Employer
+        for sel in ['[class*="employer"]', '[class*="company"]', '[class*="organisation"]',
+                    '[class*="posted-by"]']:
+            el = soup.select_one(sel)
+            if el:
+                text = clean_text(el.get_text())
+                text = re.sub(r'^(Company|Employer|Posted by)\s*:?\s*', '', text, flags=re.IGNORECASE).strip()
+                if text and len(text) > 1 and len(text) < 200:
+                    details["company"] = text
+                    break
+
+        # Location
+        for sel in ['[class*="location"]', '[class*="workplace"]']:
+            el = soup.select_one(sel)
+            if el:
+                text = clean_text(el.get_text())
+                text = re.sub(r'^Location\s*:?\s*', '', text, flags=re.IGNORECASE).strip()
+                if text and len(text) > 2:
+                    details["location"] = text
+                    break
+
+        # Salary
+        for sel in ['[class*="salary"]', '[class*="pay"]', '[class*="wage"]']:
+            el = soup.select_one(sel)
+            if el:
+                text = clean_text(el.get_text())
+                text = re.sub(r'^Salary\s*:?\s*', '', text, flags=re.IGNORECASE).strip()
+                if text and len(text) > 2:
+                    sal = parse_salary(text)
+                    details["salary_raw"] = sal["raw"]
+                    details["salary_min"] = sal["min"]
+                    details["salary_max"] = sal["max"]
+                    details["salary_period"] = sal["period"]
+                    break
+
+        # Employment type
         el = soup.select_one('[class*="contract-type"]') or soup.select_one('[class*="employment"]')
         if el:
             details["employment_type"] = clean_text(el.get_text())
 
+        # Closing date
         el = soup.select_one('[class*="closing-date"]')
         if el:
             details["valid_through"] = clean_text(el.get_text())
+
+        # Also try to extract from definition lists (gov.uk commonly uses dl/dt/dd)
+        for dt in soup.select("dt"):
+            label = clean_text(dt.get_text()).lower().rstrip(":")
+            dd = dt.find_next_sibling("dd")
+            if not dd:
+                continue
+            value = clean_text(dd.get_text())
+            if not value:
+                continue
+            if label in ("employer", "company", "organisation") and not details.get("company"):
+                details["company"] = value
+            elif label in ("location", "workplace", "address") and not details.get("location"):
+                details["location"] = value
+            elif label in ("salary", "pay", "wage") and not details.get("salary_raw"):
+                sal = parse_salary(value)
+                details["salary_raw"] = sal["raw"]
+                details["salary_min"] = sal["min"]
+                details["salary_max"] = sal["max"]
+                details["salary_period"] = sal["period"]
+            elif label in ("contract type", "job type", "employment type") and not details.get("employment_type"):
+                details["employment_type"] = value
+            elif label in ("closing date", "expires") and not details.get("valid_through"):
+                details["valid_through"] = value
 
         return details

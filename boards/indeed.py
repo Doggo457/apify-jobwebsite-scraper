@@ -1,4 +1,4 @@
-"""Indeed.co.uk job board scraper."""
+"""Indeed job board scraper — supports UK and international variants."""
 
 import json
 import re
@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 
 from ..utils import BaseScraper, parse_salary, clean_text
 
-BASE_URL = "https://uk.indeed.com"
+BASE_URL = "https://uk.indeed.com"  # Default for IndeedUKScraper
 
 JOB_TYPE_MAP = {
     "all": "",
@@ -27,6 +27,10 @@ class IndeedUKScraper(BaseScraper):
     proxies, results may be limited. Falls back to JSON-LD extraction when
     available.
     """
+
+    def __init__(self, client, delay: float = 1.5, **kwargs):
+        super().__init__(client, delay, **kwargs)
+        self.fetch_details = False
 
     @property
     def source_name(self) -> str:
@@ -61,7 +65,7 @@ class IndeedUKScraper(BaseScraper):
             url = self._build_url(keyword, location, job_type, salary_min, start)
             Actor.log.info(f"[Indeed UK] Scraping offset {start}: {url}")
 
-            html = await self._fetch(url)
+            html = await self._get_html(url)
             if not html:
                 Actor.log.warning("[Indeed UK] Failed to fetch - Indeed requires browser rendering or residential proxy")
                 break
@@ -74,6 +78,15 @@ class IndeedUKScraper(BaseScraper):
             for job in jobs:
                 if len(all_jobs) >= max_results:
                     break
+
+                # Fetch detail page if enabled and job has a URL
+                if self.fetch_details and job.get("url"):
+                    detail = await self._parse_detail_page(job["url"])
+                    for k, v in detail.items():
+                        if v and not job.get(k):
+                            job[k] = v
+                    await self._polite_delay()
+
                 all_jobs.append(job)
 
             if not has_next or len(all_jobs) >= max_results:
@@ -84,6 +97,45 @@ class IndeedUKScraper(BaseScraper):
 
         Actor.log.info(f"[Indeed UK] Total scraped: {len(all_jobs)}")
         return all_jobs
+
+    async def _parse_detail_page(self, url: str) -> dict:
+        html = await self._get_html(url)
+        if not html:
+            return {}
+        jsonld_jobs = self._extract_jsonld_jobs(html)
+        if jsonld_jobs:
+            return jsonld_jobs[0]
+        soup = BeautifulSoup(html, "html.parser")
+        details = {}
+        for sel in ['[id="jobDescriptionText"]', '[class*="jobsearch-jobDescriptionText"]',
+                    '[class*="description"]', '[itemprop="description"]']:
+            el = soup.select_one(sel)
+            if el and len(el.get_text(strip=True)) > 50:
+                details["full_description"] = el.get_text(separator="\n", strip=True)
+                details["snippet"] = clean_text(el.get_text())[:500]
+                break
+        for sel in ['[data-testid="inlineHeader-companyName"]', '[class*="companyName"]',
+                    '[itemprop="hiringOrganization"]']:
+            el = soup.select_one(sel)
+            if el:
+                details["company"] = clean_text(el.get_text())
+                break
+        for sel in ['[data-testid="inlineHeader-companyLocation"]', '[class*="companyLocation"]',
+                    '[itemprop="jobLocation"]']:
+            el = soup.select_one(sel)
+            if el:
+                details["location"] = clean_text(el.get_text())
+                break
+        for sel in ['[id="salaryInfoAndJobType"]', '[class*="salary"]', '[itemprop="baseSalary"]']:
+            el = soup.select_one(sel)
+            if el:
+                sal = parse_salary(el.get_text())
+                details["salary_raw"] = sal["raw"]
+                details["salary_min"] = sal["min"]
+                details["salary_max"] = sal["max"]
+                details["salary_period"] = sal["period"]
+                break
+        return details
 
     def _parse_search(self, html: str) -> tuple[list[dict], bool]:
         # Try JSON-LD first
@@ -205,3 +257,32 @@ class IndeedUKScraper(BaseScraper):
 
         has_next = bool(soup.select_one('a[aria-label="Next Page"]'))
         return jobs, has_next
+
+
+class IndeedScraper(IndeedUKScraper):
+    """Configurable Indeed scraper for any country variant."""
+
+    def __init__(self, client, delay: float = 1.5, base_url: str = "https://www.indeed.com", source: str = "indeed.com", **kwargs):
+        super().__init__(client, delay, **kwargs)
+        self._base_url = base_url
+        self._source = source
+
+    @property
+    def source_name(self) -> str:
+        return self._source
+
+    def _build_url(self, keyword: str, location: str, job_type: str,
+                   salary_min: int | None, start: int = 0) -> str:
+        params = [
+            f"q={quote_plus(keyword)}",
+            f"l={quote_plus(location)}",
+            "sort=date",
+        ]
+        if start > 0:
+            params.append(f"start={start}")
+        indeed_type = JOB_TYPE_MAP.get(job_type, "")
+        if indeed_type:
+            params.append(f"jt={indeed_type}")
+        if salary_min:
+            params.append(f"salary={salary_min}")
+        return f"{self._base_url}/jobs?" + "&".join(params)

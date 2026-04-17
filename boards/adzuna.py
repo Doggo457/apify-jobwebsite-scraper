@@ -8,7 +8,7 @@ from ..utils import BaseScraper, clean_text
 
 # Adzuna has a free API - users need to register at https://developer.adzuna.com
 # to get their own app_id and app_key
-API_BASE = "https://api.adzuna.com/v1/api/jobs/gb/search"
+API_BASE = "https://api.adzuna.com/v1/api/jobs/{country}/search"
 
 JOB_TYPE_MAP = {
     "all": {},
@@ -21,14 +21,16 @@ JOB_TYPE_MAP = {
 
 class AdzunaScraper(BaseScraper):
 
-    def __init__(self, client, delay: float = 0.5, app_id: str = "", app_key: str = ""):
-        super().__init__(client, delay)
+    def __init__(self, client, delay: float = 0.5, app_id: str = "", app_key: str = "", country: str = "gb", **kwargs):
+        super().__init__(client, delay, **kwargs)
         self.app_id = app_id
         self.app_key = app_key
+        self.country = country
+        self.api_base = API_BASE.format(country=country)
 
     @property
     def source_name(self) -> str:
-        return "adzuna.co.uk"
+        return f"adzuna.{self.country}"
 
     def _build_url(self, keyword: str, location: str, job_type: str,
                    salary_min: int | None, page: int, per_page: int = 20) -> str:
@@ -49,7 +51,7 @@ class AdzunaScraper(BaseScraper):
         if salary_min:
             params.append(f"salary_min={salary_min}")
 
-        return f"{API_BASE}/{page}?" + "&".join(params)
+        return f"{self.api_base}/{page}?" + "&".join(params)
 
     async def search(self, keyword: str, location: str, max_results: int = 50,
                      job_type: str = "all", salary_min: int | None = None) -> list[dict]:

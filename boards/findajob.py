@@ -27,6 +27,10 @@ class FindAJobScraper(BaseScraper):
     blocks proxy traffic but allows direct requests.
     """
 
+    def __init__(self, client, delay: float = 1.5, **kwargs):
+        super().__init__(client, delay, **kwargs)
+        self.fetch_details = False  # Set by main.py, saves ~50% requests
+
     @property
     def source_name(self) -> str:
         return "findajob.dwp.gov.uk"
@@ -94,7 +98,8 @@ class FindAJobScraper(BaseScraper):
                 if len(all_jobs) >= max_results:
                     break
 
-                if job.get("url"):
+                # Fetch detail page only if enabled (expensive: 1 request per job)
+                if self.fetch_details and job.get("url"):
                     detail_html = await self._fetch_direct(job["url"])
                     if detail_html:
                         detail = self._parse_detail_html(detail_html)

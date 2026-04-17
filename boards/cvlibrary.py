@@ -21,6 +21,10 @@ JOB_TYPE_MAP = {
 
 class CVLibraryScraper(BaseScraper):
 
+    def __init__(self, client, delay: float = 1.5, **kwargs):
+        super().__init__(client, delay, **kwargs)
+        self.fetch_details = False
+
     @property
     def source_name(self) -> str:
         return "cv-library.co.uk"
@@ -47,9 +51,9 @@ class CVLibraryScraper(BaseScraper):
         return f"{BASE_URL}/search-jobs?" + "&".join(params)
 
     async def _fetch_with_retry(self, url: str, retries: int = 2) -> str | None:
-        """Fetch with retry for flaky connections."""
+        """Fetch with retry for flaky connections — uses browser if available."""
         for attempt in range(retries + 1):
-            html = await self._fetch(url)
+            html = await self._get_html(url)
             if html:
                 return html
             if attempt < retries:
@@ -78,6 +82,14 @@ class CVLibraryScraper(BaseScraper):
             for job in jobs:
                 if len(all_jobs) >= max_results:
                     break
+
+                if self.fetch_details and job.get("url"):
+                    detail = await self._parse_detail(job["url"])
+                    for k, v in detail.items():
+                        if v and not job.get(k):
+                            job[k] = v
+                    await self._polite_delay()
+
                 all_jobs.append(job)
 
             if not has_next or len(all_jobs) >= max_results:
@@ -88,6 +100,42 @@ class CVLibraryScraper(BaseScraper):
 
         Actor.log.info(f"[CV-Library] Total scraped: {len(all_jobs)}")
         return all_jobs
+
+    async def _parse_detail(self, url: str) -> dict:
+        html = await self._get_html(url)
+        if not html:
+            return {}
+        jsonld_jobs = self._extract_jsonld_jobs(html)
+        if jsonld_jobs:
+            return jsonld_jobs[0]
+        soup = BeautifulSoup(html, "html.parser")
+        details = {}
+        for sel in ['[class*="job-description"]', '[class*="description"]', '[itemprop="description"]']:
+            el = soup.select_one(sel)
+            if el and len(el.get_text(strip=True)) > 50:
+                details["full_description"] = el.get_text(separator="\n", strip=True)
+                details["snippet"] = clean_text(el.get_text())[:500]
+                break
+        for sel in ['[class*="company"]', '[itemprop="hiringOrganization"]']:
+            el = soup.select_one(sel)
+            if el:
+                details["company"] = clean_text(el.get_text())
+                break
+        for sel in ['[class*="location"]', '[itemprop="jobLocation"]']:
+            el = soup.select_one(sel)
+            if el:
+                details["location"] = clean_text(el.get_text())
+                break
+        for sel in ['[class*="salary"]', '[itemprop="baseSalary"]']:
+            el = soup.select_one(sel)
+            if el:
+                sal = parse_salary(el.get_text())
+                details["salary_raw"] = sal["raw"]
+                details["salary_min"] = sal["min"]
+                details["salary_max"] = sal["max"]
+                details["salary_period"] = sal["period"]
+                break
+        return details
 
     def _parse_search(self, html: str) -> tuple[list[dict], bool]:
         # Try JSON-LD first

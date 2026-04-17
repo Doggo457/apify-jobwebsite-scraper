@@ -1,18 +1,83 @@
 """
-Shared utilities for UK Jobs Board scrapers.
-Common salary parsing, data normalisation, and base scraper class.
+Shared utilities for International Jobs Board scrapers.
+Common salary parsing, data normalisation, base scraper class with
+Playwright browser support, stealth JS, and proxy rotation.
 """
 
 import json
 import re
 import asyncio
+import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 from apify import Actor
 from bs4 import BeautifulSoup
+
+
+# ── Stealth JS injected into every browser context ──────────────────────
+STEALTH_JS = """
+// Hide webdriver flag
+Object.defineProperty(navigator, 'webdriver', { get: () => false });
+
+// Fake plugins
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [
+        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+        { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+        { name: 'Native Client', filename: 'internal-nacl-plugin' },
+    ],
+});
+
+// Fake languages
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['en-GB', 'en-US', 'en'],
+});
+
+// Spoof WebGL renderer
+const getParameter = WebGLRenderingContext.prototype.getParameter;
+WebGLRenderingContext.prototype.getParameter = function(parameter) {
+    if (parameter === 37445) return 'Intel Inc.';
+    if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+    return getParameter.call(this, parameter);
+};
+
+// Chrome runtime
+window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+
+// Permissions API
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications' ?
+        Promise.resolve({ state: Notification.permission }) :
+        originalQuery(parameters)
+);
+
+// Prevent iframe detection
+Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+    get: function() { return window; }
+});
+
+// Override toString for modified functions
+const nativeToString = Function.prototype.toString;
+Function.prototype.toString = function() {
+    if (this === WebGLRenderingContext.prototype.getParameter) {
+        return 'function getParameter() { [native code] }';
+    }
+    return nativeToString.call(this);
+};
+"""
+
+# Resources to block in browser (reduces detection, saves bandwidth)
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
+BLOCKED_URL_PATTERNS = [
+    "google-analytics", "googletagmanager", "facebook.net",
+    "doubleclick.net", "hotjar", "segment.io", "optimizely",
+    "newrelic", "sentry.io", "fullstory",
+]
 
 
 @dataclass
@@ -63,6 +128,12 @@ def parse_salary(salary_text: str) -> dict:
     if not salary_text or "competitive" in salary_text.lower() or "negotiable" in salary_text.lower():
         return result
 
+    # Detect currency
+    if "$" in salary_text or "USD" in salary_text.upper():
+        result["currency"] = "USD"
+    elif "€" in salary_text or "EUR" in salary_text.upper():
+        result["currency"] = "EUR"
+
     # Detect period
     lower = salary_text.lower()
     if "per day" in lower or "/day" in lower or "a day" in lower:
@@ -75,7 +146,7 @@ def parse_salary(salary_text: str) -> dict:
         result["period"] = "month"
 
     # Extract numbers - handle formats like £30,000 or £30k or 30000
-    cleaned = salary_text.replace(",", "").replace("£", "").replace("$", "")
+    cleaned = salary_text.replace(",", "").replace("£", "").replace("$", "").replace("€", "")
     # Handle 30k format
     cleaned = re.sub(r"(\d+)k\b", lambda m: str(int(m.group(1)) * 1000), cleaned, flags=re.IGNORECASE)
 
@@ -115,11 +186,16 @@ def make_headers() -> dict:
 
 
 class BaseScraper(ABC):
-    """Base class for all job board scrapers."""
+    """Base class for all job board scrapers with optional Playwright browser support."""
 
-    def __init__(self, client: httpx.AsyncClient, delay: float = 1.5):
+    def __init__(self, client: httpx.AsyncClient, delay: float = 1.5,
+                 browser=None, proxy_url: str | None = None, proxy_config=None):
         self.client = client
         self.delay = delay
+        self.browser = browser
+        self.proxy_url = proxy_url
+        self.proxy_config = proxy_config
+        self._proxy_failures = 0
 
     @property
     @abstractmethod
@@ -133,8 +209,10 @@ class BaseScraper(ABC):
         """Run a search and return unified job listings."""
         ...
 
+    # ── HTTP fetching ────────────────────────────────────────────────────
+
     async def _fetch(self, url: str) -> str | None:
-        """Fetch a URL with error handling."""
+        """Fetch a URL with httpx (no browser)."""
         try:
             response = await self.client.get(url, follow_redirects=True)
             response.raise_for_status()
@@ -153,9 +231,176 @@ class BaseScraper(ABC):
             Actor.log.warning(f"[{self.source_name}] Failed to fetch JSON {url}: {e}")
             return None
 
+    # ── Browser fetching (Playwright + stealth) ──────────────────────────
+
+    async def _get_html(self, url: str) -> str | None:
+        """Smart fetch: uses Playwright browser if available, falls back to httpx."""
+        if self.browser:
+            html = await self._fetch_browser(url)
+            if html:
+                return html
+            # Browser failed all attempts — try httpx as last resort
+            Actor.log.info(f"[{self.source_name}] Browser failed, trying httpx fallback for {url}")
+            return await self._fetch(url)
+        return await self._fetch(url)
+
+    async def _fetch_browser(self, url: str, max_attempts: int = 3) -> str | None:
+        """Fetch a URL using Playwright with stealth and proxy rotation."""
+        if not self.browser:
+            return await self._fetch(url)
+
+        for attempt in range(max_attempts):
+            try:
+                html = await self._fetch_browser_once(url)
+                if html and len(html) > 5000:
+                    self._proxy_failures = 0
+                    return html
+                Actor.log.warning(f"[{self.source_name}] Browser fetch returned thin page ({len(html) if html else 0} bytes), attempt {attempt + 1}/{max_attempts}")
+            except Exception as e:
+                Actor.log.warning(f"[{self.source_name}] Browser fetch error (attempt {attempt + 1}): {e}")
+                # Rotate proxy on timeouts and connection errors
+                await self._rotate_proxy()
+
+            if attempt < max_attempts - 1:
+                wait = 3 + random.random() * 4
+                Actor.log.info(f"[{self.source_name}] Retrying in {wait:.1f}s...")
+                await asyncio.sleep(wait)
+
+        Actor.log.warning(f"[{self.source_name}] All {max_attempts} browser attempts failed for {url}")
+        return None
+
+    @staticmethod
+    def _parse_proxy_url(proxy_url: str) -> dict:
+        """Parse a proxy URL into Playwright's proxy format with separate credentials."""
+        parsed = urlparse(proxy_url)
+        proxy_dict = {
+            "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+        }
+        if parsed.username:
+            proxy_dict["username"] = parsed.username
+        if parsed.password:
+            proxy_dict["password"] = parsed.password
+        return proxy_dict
+
+    async def _fetch_browser_once(self, url: str) -> str | None:
+        """Single browser fetch attempt with stealth context."""
+        if not self.browser:
+            return None
+
+        # Parse proxy URL into Playwright format (server + username + password)
+        proxy_arg = None
+        if self.proxy_url:
+            proxy_arg = self._parse_proxy_url(self.proxy_url)
+            Actor.log.debug(f"[{self.source_name}] Using proxy server: {proxy_arg.get('server')}")
+
+        context = await self.browser.new_context(
+            proxy=proxy_arg,
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            locale="en-GB",
+            timezone_id="Europe/London",
+            java_script_enabled=True,
+            bypass_csp=True,
+        )
+
+        try:
+            page = await context.new_page()
+
+            # Inject stealth JS before any page loads
+            await page.add_init_script(STEALTH_JS)
+
+            # Block tracking/analytics resources
+            await page.route("**/*", self._block_resources)
+
+            Actor.log.info(f"[{self.source_name}] Navigating to {url}")
+
+            # Navigate — use networkidle so JS-rendered content (Next.js etc) finishes loading
+            try:
+                response = await page.goto(url, wait_until="networkidle", timeout=60000)
+            except Exception:
+                # networkidle can be flaky, fall back to load
+                Actor.log.info(f"[{self.source_name}] networkidle timed out, trying load event...")
+                response = await page.goto(url, wait_until="load", timeout=30000)
+
+            if not response:
+                Actor.log.warning(f"[{self.source_name}] No response from page")
+                return None
+
+            Actor.log.info(f"[{self.source_name}] Page loaded, status={response.status}")
+
+            # Handle Cloudflare challenge pages
+            page_title = await page.title()
+            if response.status == 403 or "challenge" in page_title.lower() or "just a moment" in page_title.lower():
+                Actor.log.info(f"[{self.source_name}] Cloudflare/challenge detected (title='{page_title}'), waiting 8s...")
+                await page.wait_for_timeout(8000)
+                page_title = await page.title()
+                if "challenge" in page_title.lower() or "just a moment" in page_title.lower():
+                    Actor.log.warning(f"[{self.source_name}] Still blocked by Cloudflare after wait")
+                    return None
+                Actor.log.info(f"[{self.source_name}] Challenge passed, new title='{page_title}'")
+
+            # Wait for JS content to fully render (Next.js apps need this)
+            await page.wait_for_timeout(3000 + random.randint(0, 2000))
+
+            # Try to wait for common job card selectors to appear
+            for selector in ['[data-testid="job-card"]', 'article', '[class*="job"]', '[class*="search-result"]']:
+                try:
+                    await page.wait_for_selector(selector, timeout=5000)
+                    Actor.log.info(f"[{self.source_name}] Found content selector: {selector}")
+                    break
+                except Exception:
+                    continue
+
+            html = await page.content()
+            Actor.log.info(f"[{self.source_name}] Got {len(html)} bytes of HTML")
+            return html
+
+        finally:
+            await context.close()
+
+    async def _block_resources(self, route):
+        """Block tracking/analytics resources to reduce detection."""
+        request = route.request
+        if request.resource_type in BLOCKED_RESOURCE_TYPES:
+            await route.abort()
+            return
+        url_lower = request.url.lower()
+        for pattern in BLOCKED_URL_PATTERNS:
+            if pattern in url_lower:
+                await route.abort()
+                return
+        await route.continue_()
+
+    # ── Proxy rotation ───────────────────────────────────────────────────
+
+    async def _rotate_proxy(self):
+        """Rotate to a new proxy URL if proxy config is available."""
+        if self.proxy_config:
+            try:
+                # Sanitize source_name: session_id only allows [\w._~]
+                safe_name = re.sub(r"[^a-zA-Z0-9._~]", "_", self.source_name)
+                new_session = f"{safe_name}_{random.randint(10000, 99999)}"
+                self.proxy_url = await self.proxy_config.new_url(session_id=new_session)
+                self._proxy_failures = 0
+                Actor.log.info(f"[{self.source_name}] Rotated to new proxy session")
+            except Exception as e:
+                Actor.log.warning(f"[{self.source_name}] Proxy rotation failed: {e}")
+
+    @staticmethod
+    def _is_proxy_error(error) -> bool:
+        """Check if an error is likely proxy-related."""
+        err_str = str(error).lower()
+        return any(kw in err_str for kw in [
+            "proxy", "tunnel", "connect", "timeout", "reset",
+            "connection refused", "502", "503", "407",
+        ])
+
+    # ── Utilities ────────────────────────────────────────────────────────
+
     async def _polite_delay(self):
-        """Wait between requests to be respectful."""
-        await asyncio.sleep(self.delay)
+        """Wait between requests with random jitter."""
+        jitter = self.delay + random.uniform(0.2, 0.8)
+        await asyncio.sleep(jitter)
 
     def _extract_jsonld_jobs(self, html: str) -> list[dict]:
         """Extract job postings from JSON-LD structured data in HTML."""
