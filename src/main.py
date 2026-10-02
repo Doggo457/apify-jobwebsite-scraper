@@ -436,6 +436,8 @@ async def main() -> None:
         # compute waste and the status message would lie about them. Cap the
         # target at the affordable row count and say so up front.
         budget_rows = _affordable_rows()
+        if budget_rows is not None:
+            budget_rows -= 1   # the platform ABORTS a run that reaches its limit exactly; stay one row under
         if budget_rows is not None and (unlimited or budget_rows < max_results):
             budget_usd = Actor.get_charging_manager().get_max_total_charge_usd()
             if budget_rows <= 0:
