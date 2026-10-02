@@ -9,3 +9,8 @@ storage
 *.jpg
 *.png
 .venv
+# Stale pre-0.4 copies at the repo root (the live code is under src/)
+/main.py
+/utils.py
+/boards/
+/input_schema.json
