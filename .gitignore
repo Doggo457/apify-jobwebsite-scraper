@@ -14,3 +14,5 @@ Claude outputs/
 /boards/
 /input_schema.json
 /__init__.py
+# Local build/push logs
+*.log
