@@ -158,5 +158,18 @@ check("merged_count == len(merge_jobs) with dedup", pipeline.merged_count(sample
 check("merged_count == len(jobs) without dedup", pipeline.merged_count(sample, False) == len(sample))
 check("merged_count leaves jobs untouched", "sources" not in sample[0])
 
+# ── v0.12: Arbeitnow honours location='Remote' (used by the Remote task) ──
+print("Arbeitnow location filter")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from src.boards.arbeitnow import ArbeitnowScraper  # noqa: E402
+toks = ["software", "engineer"]
+berlin = {"title": "Software Engineer", "description": "", "tags": [], "location": "Berlin", "remote": False}
+remote = {"title": "Software Engineer", "description": "", "tags": [], "location": "Berlin", "remote": True}
+other = {"title": "Chef", "description": "", "tags": [], "location": "Berlin", "remote": True}
+check("remote keeps only remote listings", ArbeitnowScraper.wanted(remote, toks, "remote") and not ArbeitnowScraper.wanted(berlin, toks, "remote"))
+check("empty location keeps everything matching", ArbeitnowScraper.wanted(berlin, toks, "") and ArbeitnowScraper.wanted(remote, toks, ""))
+check("city keeps that city plus remote", ArbeitnowScraper.wanted(berlin, toks, "berlin") and ArbeitnowScraper.wanted(remote, toks, "munich") and not ArbeitnowScraper.wanted(berlin, toks, "munich"))
+check("keyword tokens still required", not ArbeitnowScraper.wanted(other, toks, "remote"))
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

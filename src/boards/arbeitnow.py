@@ -25,11 +25,25 @@ class ArbeitnowScraper(BaseScraper):
     def source_name(self) -> str:
         return "arbeitnow.com"
 
+    @staticmethod
+    def wanted(item: dict, toks: list[str], loc: str) -> bool:
+        """Client-side filter: every keyword token in title/description/tags,
+        and the location rule: '' = anywhere, 'remote' = remote listings only,
+        anything else = that place (remote listings always qualify)."""
+        hay = f"{item.get('title', '')} {item.get('description') or ''} {' '.join(item.get('tags') or [])}".lower()
+        if not all(t in hay for t in toks):
+            return False
+        is_remote = bool(item.get("remote"))
+        if loc == "remote":
+            return is_remote
+        if loc and loc not in (item.get("location") or "").lower() and not is_remote:
+            return False
+        return True
+
     async def search(self, keyword, location, max_results=50, job_type="all", salary_min=None) -> list[dict]:
         self.stats["mode"] = "api"
         toks = keyword_tokens(keyword)
         loc = (location or "").lower().strip()
-        want_remote = loc in ("", "remote")
         all_jobs: list[dict] = []
         if self.exhausted:
             return all_jobs
@@ -45,16 +59,12 @@ class ArbeitnowScraper(BaseScraper):
                 break
             fresh = []
             for it in items:
+                if not self.wanted(it, toks, loc):
+                    continue
                 title = it.get("title", "")
                 desc = it.get("description", "") or ""
                 tags = it.get("tags") or []
-                hay = f"{title} {desc} {' '.join(tags)}".lower()
-                if not all(t in hay for t in toks):
-                    continue
-                item_loc = (it.get("location") or "").lower()
                 is_remote = bool(it.get("remote"))
-                if not want_remote and loc not in item_loc and not is_remote:
-                    continue
                 job_types = it.get("job_types") or []
                 fresh.append({
                     "source": self.source_name,
