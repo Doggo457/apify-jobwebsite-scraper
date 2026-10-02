@@ -43,6 +43,8 @@ from .boards.findajob import FindAJobScraper
 from .boards.indeed import IndeedScraper, IndeedUKScraper
 from .boards.jobicy import JobicyScraper
 from .boards.reed import ReedScraper
+from .boards.seek import SeekScraper
+from .boards.stepstone_de import StepStoneDEScraper
 from .boards.remoteok import RemoteOKScraper
 from .boards.remotive import RemotiveScraper
 from .boards.themuse import TheMuseScraper
@@ -70,6 +72,8 @@ BOARD_REGISTRY: dict[str, tuple] = {
     "usajobs":   (USAJobsScraper, "api"),
     "remoteok":  (RemoteOKScraper, "api"),
     "arbeitnow": (ArbeitnowScraper, "api"),
+    "stepstone_de": (StepStoneDEScraper, "html"),
+    "seek":      (SeekScraper, "api"),
     "themuse":   (TheMuseScraper, "api"),
     "remotive":  (RemotiveScraper, "api"),
     "jobicy":    (JobicyScraper, "api"),
@@ -79,10 +83,10 @@ BOARD_REGISTRY: dict[str, tuple] = {
 COUNTRY_DEFAULTS = {
     "uk": ["reed", "totaljobs", "cvlibrary", "cwjobs", "indeed", "findajob", "adzuna", "themuse"],
     "us": ["usajobs", "indeed_us", "adzuna", "remoteok", "themuse", "remotive"],
-    "de": ["indeed_de", "adzuna", "arbeitnow", "themuse"],
+    "de": ["stepstone_de", "indeed_de", "adzuna", "arbeitnow", "themuse"],
     "fr": ["indeed_fr", "adzuna", "themuse"],
     "nl": ["indeed_nl", "adzuna", "themuse"],
-    "au": ["indeed_au", "adzuna", "themuse"],
+    "au": ["seek", "indeed_au", "adzuna", "themuse"],
     "remote": ["remoteok", "arbeitnow", "remotive", "jobicy", "themuse", "adzuna"],
 }
 ADZUNA_COUNTRY_MAP = {"uk": "gb", "us": "us", "de": "de", "fr": "fr", "nl": "nl", "au": "au", "remote": "gb"}

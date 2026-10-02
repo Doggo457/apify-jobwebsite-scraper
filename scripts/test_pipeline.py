@@ -171,5 +171,59 @@ check("empty location keeps everything matching", ArbeitnowScraper.wanted(berlin
 check("city keeps that city plus remote", ArbeitnowScraper.wanted(berlin, toks, "berlin") and ArbeitnowScraper.wanted(remote, toks, "munich") and not ArbeitnowScraper.wanted(berlin, toks, "munich"))
 check("keyword tokens still required", not ArbeitnowScraper.wanted(other, toks, "remote"))
 
+# ── v0.12: StepStone UK sweep never paginates past page 4 and Indeed never asks for page 2 ──
+print("StepStone sweep / Indeed variants")
+import asyncio  # noqa: E402
+from src.boards.totaljobs import TotaljobsScraper  # noqa: E402
+from src.boards.stepstone_de import StepStoneDEScraper  # noqa: E402
+from src.boards.indeed import IndeedUKScraper  # noqa: E402
+from urllib.parse import urlparse, parse_qs  # noqa: E402
+
+class _NoClient:  # the sweep is driven through stubs; no network
+    pass
+
+tj = TotaljobsScraper(_NoClient())
+tj.max_pages = 40
+requested = []
+async def fake_get_html(url):
+    requested.append(url)
+    return url  # the "html" is the URL; the stub parser derives jobs from it
+def fake_parse(html, soup):
+    q = parse_qs(urlparse(html).query); path = urlparse(html).path
+    page = int(q.get("page", ["1"])[0]); variant = path.split("/jobs/")[1].split("/")[0] + "|" + ("sort=" + q["sort"][0] if "sort" in q else "date")
+    # 25 ids per page, unique per variant and page; 5 of them collide with the previous variant to exercise dedup
+    jobs = [{"job_id": f"{variant}-{page}-{i}", "title": "x", "url": f"https://t/{variant}-{page}-{i}"} for i in range(25)]
+    return jobs, page < 42
+tj._get_html = fake_get_html
+tj._parse_search = fake_parse
+async def _polite(): pass
+tj._polite_delay = _polite
+got = asyncio.run(tj.search("software engineer", "London", max_results=1000))
+pages = [parse_qs(urlparse(u).query).get("page", ["1"])[0] for u in requested]
+check("sweep requests 28 pages (7 searches x 4)", len(requested) == 28, len(requested))
+check("sweep never asks for page 5+", all(int(p) <= 4 for p in pages), sorted(set(pages)))
+check("sweep yields 700 unique rows", len(got) == 700 and len({j["job_id"] for j in got}) == 700, len(got))
+check("sweep uses the contract path segment", any("/jobs/contract/software-engineer/in-london" in u for u in requested))
+check("sweep uses salary-desc and relevance sorts", any("sort=4" in u for u in requested) and any("sort=1" in u for u in requested))
+check("sweep marks the board exhausted at the end", tj.exhausted)
+check("no employmenttype= param anywhere", not any("employmenttype=" in u for u in requested))
+# resumability: a small first call, then a top-up call continues the sweep
+tj2 = TotaljobsScraper(_NoClient()); tj2._get_html = fake_get_html; tj2._parse_search = fake_parse; tj2._polite_delay = _polite
+requested.clear()
+first = asyncio.run(tj2.search("software engineer", "London", max_results=60))
+second = asyncio.run(tj2.search("software engineer", "London", max_results=60))
+check("sweep resumes without repeating pages", len(requested) == 6 and len(set(requested)) == 6 and len(first) == 75 and len(second) == 75 and not tj2.exhausted, (len(requested), len(first), len(second)))
+check("job_type fixed -> only that segment, three sorts", [v[0] for v in tj2._variants("contract")] == ["contract"] * 3)
+check("StepStone.de paginates plainly", not StepStoneDEScraper.sweep and "page=7" in StepStoneDEScraper(_NoClient())._build_url("software engineer", "Berlin", "all", None, 7))
+check("salary_min becomes the annual facet", "salary=50000&salarytypeid=1" in tj._search_url("a", "b", "", "sortby=Date", 50000, 1))
+
+ind = IndeedUKScraper(_NoClient())
+urls = [ind._build_url("software engineer", "London", "all", None, p) for p in (1, 2, 3)]
+check("Indeed never requests start= (sign-in wall)", not any("start=" in u for u in urls), urls)
+check("Indeed variants differ", len(set(urls)) == 3 and "sort=date" in urls[0] and "sort=date" not in urls[1] and "radius=25" in urls[2])
+from src.utils import LazySoup  # noqa: E402
+ind._page = 3
+check("Indeed stops after its third variant", ind._parse_search("<html><body></body></html>", LazySoup("<html><body></body></html>"))[1] is False)
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

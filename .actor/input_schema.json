@@ -266,7 +266,7 @@
         "boards": {
             "title": "Job Boards to Scrape",
             "type": "array",
-            "description": "Pick specific boards or leave empty to auto-select based on your chosen country. Cost tip: the free-API boards (RemoteOK, Arbeitnow, The Muse, Remotive, Jobicy, Adzuna, USAJobs) need no browser or proxy — a run using only these is the cheapest and can be run at 1024 MB memory.",
+            "description": "Pick specific boards or leave empty to auto-select based on your chosen country. Cost tip: the free-API boards (RemoteOK, Arbeitnow, Seek, The Muse, Remotive, Jobicy, Adzuna, USAJobs) need no browser or proxy — a run using only these is the cheapest and can be run at 1024 MB memory.",
             "default": [],
             "editor": "select",
             "items": {
@@ -287,6 +287,8 @@
                     "indeed_au",
                     "remoteok",
                     "arbeitnow",
+                    "stepstone_de",
+                    "seek",
                     "themuse",
                     "remotive",
                     "jobicy"
@@ -307,6 +309,8 @@
                     "Indeed Australia (best-effort: bot protection)",
                     "RemoteOK (Global Remote)",
                     "Arbeitnow (EU & Remote)",
+                    "StepStone.de (Germany)",
+                    "Seek (Australia, free API)",
                     "The Muse (Global, free API)",
                     "Remotive (Global Remote, free API)",
                     "Jobicy (Global Remote, free API)"

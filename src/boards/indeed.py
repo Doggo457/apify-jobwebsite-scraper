@@ -59,10 +59,21 @@ class IndeedScraper(BaseScraper):
             return True
         return len(html) < 30000 and ("captcha" in head or "cf-chl" in head)
 
+    # Indeed shows ONE result page to anonymous visitors: page 2 (start=10)
+    # redirects to secure.indeed.com "page-two-signin" (verified in a real
+    # browser from a residential IP). So "pages" here are distinct first
+    # pages of related searches, which overlap only partly:
+    #   1. newest first   2. relevance   3. relevance, wider radius (or last 14 days)
+    VARIANT_PAGES = 3
+    max_pages = VARIANT_PAGES
+    hard_page_cap = VARIANT_PAGES
+
     def _build_url(self, keyword, location, job_type, salary_min, page) -> str:
-        params = [f"q={quote_plus(keyword)}", f"l={quote_plus(location)}", "sort=date"]
-        if page > 1:
-            params.append(f"start={(page - 1) * 10}")
+        params = [f"q={quote_plus(keyword)}", f"l={quote_plus(location)}"]
+        if page == 1:
+            params.append("sort=date")
+        elif page == 3:
+            params.append("fromage=14" if self.radius_miles else "radius=25")
         if job_type in JOB_TYPE_PARAM:
             params.append(f"jt={JOB_TYPE_PARAM[job_type]}")
         if salary_min:
@@ -80,8 +91,8 @@ class IndeedScraper(BaseScraper):
         if not jobs:
             # Fire-and-forget diagnostic: the page HTML goes to the run's KV store once.
             self._pending_debug_html = html
-        has_next = bool(soup.select_one('a[aria-label="Next Page"], a[data-testid="pagination-page-next"]')) or len(jobs) >= 10
-        return jobs, has_next and bool(jobs)
+        # Pagination is a sign-in wall; continue through the search variants instead.
+        return jobs, bool(jobs) and self._page < self.VARIANT_PAGES
 
     async def search(self, keyword, location, max_results=50, job_type="all", salary_min=None):
         self._pending_debug_html = None

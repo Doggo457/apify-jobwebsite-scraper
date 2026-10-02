@@ -25,10 +25,17 @@ Unlike a plain aggregator, this Actor doesn't just pile listings together. It **
 ### EU Boards
 | Board | What It Covers |
 |-------|---------------|
+| **StepStone.de** | Germany's largest job board, 25 per page with full pagination |
 | **Indeed DE** | Indeed Germany |
 | **Indeed FR** | Indeed France |
 | **Indeed NL** | Indeed Netherlands |
 | **Arbeitnow** | EU & remote tech jobs (free API) |
+
+### Australia
+| Board | What It Covers |
+|-------|---------------|
+| **Seek** | Australia's largest job board via its JSON search API, 100 per page (no key) |
+| **Indeed AU** | Indeed Australia |
 
 ### Global / Remote
 | Board | What It Covers |
@@ -38,7 +45,6 @@ Unlike a plain aggregator, this Actor doesn't just pile listings together. It **
 | **The Muse** | Global roles from thousands of companies (free API, no key) |
 | **Remotive** | Curated worldwide remote jobs (free API, no key) |
 | **Jobicy** | Worldwide remote jobs (free API, no key) |
-| **Indeed AU** | Indeed Australia |
 
 **The Muse, Remotive and Jobicy** are free, keyless boards that run over a fast direct connection — they add breadth at almost no cost and are included automatically in the relevant country/remote presets.
 
@@ -174,10 +180,10 @@ When you leave the boards selection empty, boards are auto-picked based on count
 |---------|--------|
 | UK | Reed, Totaljobs, CV-Library, CWJobs, Indeed UK, GOV.UK, Adzuna, The Muse |
 | US | USAJobs, Indeed US, Adzuna, RemoteOK, The Muse, Remotive |
-| Germany | Indeed DE, Adzuna, Arbeitnow, The Muse |
+| Germany | StepStone.de, Indeed DE, Adzuna, Arbeitnow, The Muse |
 | France | Indeed FR, Adzuna, The Muse |
 | Netherlands | Indeed NL, Adzuna, The Muse |
-| Australia | Indeed AU, Adzuna, The Muse |
+| Australia | Seek, Indeed AU, Adzuna, The Muse |
 | Remote | RemoteOK, Arbeitnow, Remotive, Jobicy, The Muse, Adzuna |
 
 ## Enabling the Reed API (Optional, recommended for UK runs)
@@ -220,6 +226,8 @@ Tips to keep runs even cheaper:
 - **Lower the memory for API-only runs.** If your board selection contains no browser-capable boards, set the run memory to **1024 MB** in the run options to roughly halve the compute cost. Keep the default (2048 MB) whenever Indeed or CV-Library is included.
 - Set a reasonable **Max Results** limit and leave **Unlimited Mode** off unless you really want everything.
 - Remove boards you don't need. Indeed and CV-Library sit behind aggressive bot protection and are best-effort: when they are blocked the run moves on after one attempt and the other boards make up the difference, but dropping them saves that attempt.
+- Indeed shows anonymous visitors a single page of results (page two is a sign-in wall), so the scraper runs up to three related searches per board (newest, relevance, wider radius) and merges them instead of paginating.
+- Totaljobs and CWJobs stop answering past page 4 of any search, so the scraper sweeps several distinct searches (contract type x sort order, four pages each) and merges them by job id; expect roughly 300 to 500 unique rows per board rather than 100.
 - Leave **Resolve Real Apply URL** off unless you need it; it adds a network request per job.
 
 ## Use Cases
