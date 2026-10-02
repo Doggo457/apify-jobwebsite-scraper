@@ -181,7 +181,7 @@
         "max_results": {
             "title": "Max Results",
             "type": "integer",
-            "description": "Maximum total job listings to return (spread across all boards). Minimum 100.",
+            "description": "Maximum total job listings to return (spread across all boards). Minimum 100. Billing is per row, so the run also stops at whatever your 'Maximum cost per run' setting covers; raise that limit when starting the Actor if you want more rows than it allows.",
             "default": 1000,
             "minimum": 100
         },

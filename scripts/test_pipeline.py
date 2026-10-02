@@ -99,5 +99,45 @@ check("EUR day rate still parses", (pipeline.extract_salary_from_text("€450 - 
 check("annual without currency still parses", (pipeline.extract_salary_from_text("45,000 per annum") or {}).get("min") == 45000.0)
 check("hours plural no longer matches period", (pipeline.extract_salary_from_text("£30,000 per annum, 37.5 hours") or {}).get("period") == "annum")
 
+
+# ── v0.12: every record must satisfy the registered dataset schema ──
+# actor.json registers .actor/dataset_schema.json under storages.dataset, so
+# the platform validates each push_data() item and REJECTS the whole batch on
+# a single mismatch. Run realistic records (no salary, no ATS, benchmark row)
+# through the real pipeline and validate them the way the platform does.
+print("Dataset schema")
+import json  # noqa: E402
+try:
+    from jsonschema import Draft7Validator  # noqa: E402
+except ImportError:  # keep the suite dependency-free; this check is optional
+    Draft7Validator = None
+if Draft7Validator is None:
+    print("  skip  jsonschema not installed (pip install jsonschema)")
+else:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from src import main  # noqa: E402  (needs the apify package, same as the Actor)
+    schema = json.load(open(os.path.join(os.path.dirname(__file__), "..", ".actor", "dataset_schema.json")))
+    validator = Draft7Validator(schema["fields"])
+    raw = [
+        job(source="reed.co.uk", url="https://www.reed.co.uk/jobs/x/1", snippet="No salary stated", date_posted="2 days ago"),
+        job(source="cv-library.co.uk", url="https://www.cv-library.co.uk/job/2", salary_raw="£30,000 - £40,000 per annum",
+            salary_min=30000, salary_max=40000, salary_period="annum", date_posted="2026-07-01"),
+        job(source="remoteok.com", url="https://remoteok.com/remote-jobs/3", location="Remote", title="Senior Engineer",
+            salary_raw="$150k", salary_min=150000.0, salary_max=None, salary_period="annum", salary_currency="USD"),
+        job(source="totaljobs.com", url="https://www.totaljobs.com/job/4", title="Nurse", date_posted="", company=""),
+    ]
+    now = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    records = [pipeline.enrich_job(main.normalize_job(r), {"description_format": "markdown"}, now) for r in raw]
+    records = [pipeline.finalize(r) for r in pipeline.merge_jobs(records)]
+    records += main.compute_salary_benchmarks([
+        {"title": "Dev", "location": "London", "salary_annual_min": 50000, "salary_annual_max": 60000},
+        {"title": "Dev", "location": "London", "salary_annual_min": 55000, "salary_annual_max": 65000},
+    ])
+    check("benchmark row produced", any(r.get("_type") == "salary_benchmark" for r in records))
+    for r in records:
+        errs = [f"{'.'.join(map(str, e.path))}: {e.message}" for e in validator.iter_errors(json.loads(json.dumps(r)))]
+        check(f"schema-valid {r.get('source') or r.get('_type')}", not errs, "; ".join(errs)[:200])
+    check("ats null is allowed", "null" in schema["fields"]["properties"]["ats"]["type"])
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 
 import httpx
 from apify import Actor
+from apify_client.errors import ApifyApiError
 
 from .boards.adzuna import AdzunaScraper
 from .boards.arbeitnow import ArbeitnowScraper
@@ -278,6 +279,53 @@ def compute_salary_benchmarks(jobs: list[dict]) -> list[dict]:
     return sorted(out, key=lambda b: b["count"], reverse=True)
 
 
+DATASET_ITEM_EVENT = "apify-default-dataset-item"
+
+
+def _affordable_rows() -> int | None:
+    """Rows the run's max-total-charge can still pay for, or None when the run
+    is not metered per row (local run, no PPE pricing, or no charge limit)."""
+    try:
+        cm = Actor.get_charging_manager()
+        if not cm.get_pricing_info().is_pay_per_event:
+            return None
+        return cm.calculate_max_event_charge_count_within_limit(DATASET_ITEM_EVENT)
+    except Exception as e:  # charging info is advisory; never fail a run over it
+        Actor.log.debug(f"Charging info unavailable: {e}")
+        return None
+
+
+def _charged_rows() -> int | None:
+    try:
+        cm = Actor.get_charging_manager()
+        if not cm.get_pricing_info().is_pay_per_event:
+            return None
+        return cm.get_charged_event_count(DATASET_ITEM_EVENT)
+    except Exception:
+        return None
+
+
+async def push_rows(items: list[dict]) -> int:
+    """Push to the default dataset. actor.json registers the dataset schema,
+    so the platform rejects a whole batch when ONE record fails validation;
+    bisect such a batch so one bad record costs one row, not the run.
+    Returns the number of records accepted."""
+    if not items:
+        return 0
+    try:
+        await Actor.push_data(items)
+        return len(items)
+    except ApifyApiError as exc:
+        if "schema" not in str(exc.message or exc).lower():
+            raise
+        if len(items) == 1:
+            Actor.log.warning(f"Dataset schema rejected a record, dropping it: {items[0].get('url') or items[0]} "
+                              f"({exc.message}; {exc.data or ''})")
+            return 0
+        mid = len(items) // 2
+        return await push_rows(items[:mid]) + await push_rows(items[mid:])
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Board runner with a wall-clock budget
 # ──────────────────────────────────────────────────────────────────────
@@ -382,6 +430,24 @@ async def main() -> None:
             await Actor.set_status_message("No valid boards selected", is_terminal=True)
             return
 
+        # ── Budget awareness (pay-per-event) ──
+        # The platform silently truncates push_data() to whatever the run's
+        # "max total charge" still covers, so rows scraped beyond that are pure
+        # compute waste and the status message would lie about them. Cap the
+        # target at the affordable row count and say so up front.
+        budget_rows = _affordable_rows()
+        if budget_rows is not None and (unlimited or budget_rows < max_results):
+            budget_usd = Actor.get_charging_manager().get_max_total_charge_usd()
+            if budget_rows <= 0:
+                Actor.log.error(f"Run budget (${budget_usd:.2f} max total charge) cannot pay for a single row after the start fee")
+                await Actor.set_status_message(
+                    "Run budget too low for any rows: raise 'Maximum cost per run' when starting the Actor", is_terminal=True)
+                return
+            Actor.log.warning(
+                f"Run budget ${budget_usd:.2f} covers {budget_rows} rows (requested {max_results or 'unlimited'}); "
+                f"capping this run at {budget_rows}. Raise 'Maximum cost per run' when starting the Actor to get more.")
+            max_results, unlimited = budget_rows, False
+
         Actor.log.info(f"Starting multi-board scrape: {search_terms} in '{location}' (country={country})")
         Actor.log.info(f"Boards: {selected_boards}")
         Actor.log.info(f"Max results: {max_results or 'unlimited'} | Contract type: {job_type} | "
@@ -461,6 +527,7 @@ async def main() -> None:
 
         raw_jobs: list[dict] = []
         all_jobs: list[dict] = []
+        rows_pushed = 0
         board_attempts = 0
         board_errors = 0
         dead_boards: set[str] = set()          # circuit breaker for expensive (browser) boards
@@ -605,7 +672,12 @@ async def main() -> None:
             all_jobs = [pipeline.finalize(j) for j in merged]
             Actor.log.info(f"Pushing {len(all_jobs)} jobs to dataset...")
             for i in range(0, len(all_jobs), PUSH_BATCH):
-                await Actor.push_data(all_jobs[i:i + PUSH_BATCH])
+                rows_pushed += await push_rows(all_jobs[i:i + PUSH_BATCH])
+            charged = _charged_rows()
+            if charged is not None and charged < rows_pushed:
+                Actor.log.warning(f"Run budget reached: {charged} of {rows_pushed} rows were stored. "
+                                  "Raise 'Maximum cost per run' when starting the Actor to get the rest.")
+                rows_pushed = charged
 
             if incremental_only and store is not None:
                 new_seen = pipeline.updated_seen_list(prior_seen, all_jobs)
@@ -616,7 +688,7 @@ async def main() -> None:
                 benchmarks = compute_salary_benchmarks(all_jobs)
                 Actor.log.info(f"Generated {len(benchmarks)} salary benchmarks")
                 for i in range(0, len(benchmarks), PUSH_BATCH):
-                    await Actor.push_data(benchmarks[i:i + PUSH_BATCH])
+                    await push_rows(benchmarks[i:i + PUSH_BATCH])
         finally:
             for c in clients:
                 try:
@@ -634,7 +706,8 @@ async def main() -> None:
             source_counts[src] = source_counts.get(src, 0) + 1
         summary = {
             "search_terms": search_terms, "location": location, "country": country, "boards": selected_boards,
-            "rows_pushed": len(all_jobs), "raw_collected": len(raw_jobs), "elapsed_secs": elapsed,
+            "rows_pushed": rows_pushed, "rows_prepared": len(all_jobs), "raw_collected": len(raw_jobs),
+            "elapsed_secs": elapsed, "budget_capped": budget_rows is not None and rows_pushed >= budget_rows,
             "browser_launched": bool(browser_pool and browser_pool.launched),
             "per_board": stats, "rows_per_source": source_counts,
         }
@@ -643,12 +716,13 @@ async def main() -> None:
         except Exception as e:
             Actor.log.debug(f"RUN_STATS not saved: {e}")
         Actor.log.info("══════════ SCRAPE COMPLETE ══════════")
-        Actor.log.info(f"rows={len(all_jobs)} raw={len(raw_jobs)} elapsed={elapsed}s "
+        Actor.log.info(f"rows={rows_pushed} prepared={len(all_jobs)} raw={len(raw_jobs)} elapsed={elapsed}s "
                        f"browser={'yes' if summary['browser_launched'] else 'no'}")
         for e in stats.values():
             Actor.log.info(f"  {e['source']:<22} {e['jobs']:>5} jobs  {e['pages']:>3} pages  {e['mode']:<8} {e['secs']:>6}s  {e['error']}")
+        note = " (run budget reached, raise 'Maximum cost per run' for more)" if summary["budget_capped"] else ""
         await Actor.set_status_message(
-            f"Done: {len(all_jobs)} jobs from {sum(1 for e in stats.values() if e['jobs'])}/{len(selected_boards)} boards in {elapsed}s",
+            f"Done: {rows_pushed} jobs from {sum(1 for e in stats.values() if e['jobs'])}/{len(selected_boards)} boards in {elapsed}s{note}",
             is_terminal=True)
 
 

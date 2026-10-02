@@ -22,7 +22,10 @@
                 "example": "London"
             },
             "salary_raw": {
-                "type": "string",
+                "type": [
+                    "string",
+                    "null"
+                ],
                 "title": "Salary",
                 "description": "Original salary text from the listing",
                 "example": "£30,000 - £40,000 per annum"
@@ -46,43 +49,64 @@
                 "example": 40000
             },
             "salary_currency": {
-                "type": "string",
+                "type": [
+                    "string",
+                    "null"
+                ],
                 "title": "Salary Currency",
                 "description": "ISO currency code, based on the job's source country — GBP, USD, EUR, or AUD",
                 "example": "GBP"
             },
             "salary_period": {
-                "type": "string",
+                "type": [
+                    "string",
+                    "null"
+                ],
                 "title": "Salary Period",
                 "description": "Salary period — annum, day, or hour",
                 "example": "annum"
             },
             "employment_type": {
-                "type": "string",
+                "type": [
+                    "string",
+                    "null"
+                ],
                 "title": "Employment Type",
                 "description": "Permanent, Contract, Temporary, or Part-time",
                 "example": "Permanent"
             },
             "work_mode": {
-                "type": "string",
+                "type": [
+                    "string",
+                    "null"
+                ],
                 "title": "Work Mode",
                 "description": "Remote, Hybrid or On-site where the listing states it (empty when not stated)",
                 "example": "Hybrid"
             },
             "snippet": {
-                "type": "string",
+                "type": [
+                    "string",
+                    "null"
+                ],
                 "title": "Snippet",
                 "description": "Short description from search results",
                 "example": "We are looking for a passionate junior developer to join our growing team..."
             },
             "date_posted": {
-                "type": "string",
+                "type": [
+                    "string",
+                    "null"
+                ],
                 "title": "Date Posted",
                 "description": "When the job was listed, normalised to an ISO date (YYYY-MM-DD) wherever the board gives a readable date; see posted_at for the full timestamp",
                 "example": "2026-03-05"
             },
             "valid_through": {
-                "type": "string",
+                "type": [
+                    "string",
+                    "null"
+                ],
                 "title": "Valid Through",
                 "description": "Application deadline (where available)",
                 "example": "2026-04-05"
@@ -106,13 +130,19 @@
                 "example": "reed.co.uk"
             },
             "category": {
-                "type": "string",
+                "type": [
+                    "string",
+                    "null"
+                ],
                 "title": "Category",
                 "description": "Job category — from the board where provided (e.g. Adzuna), otherwise inferred from the job title",
                 "example": "IT Jobs"
             },
             "description": {
-                "type": "string",
+                "type": [
+                    "string",
+                    "null"
+                ],
                 "title": "Description",
                 "description": "Full job description, formatted as Markdown (default), HTML or plain text per the Description Format input",
                 "example": "**About the role**\n\nWe are looking for a passionate engineer..."
@@ -140,31 +170,48 @@
                 "example": 3
             },
             "ats": {
-                "type": "string",
+                "type": [
+                    "string",
+                    "null"
+                ],
                 "title": "ATS",
                 "description": "Applicant Tracking System detected from the apply URL — greenhouse, lever, ashby, workday, workable, smartrecruiters, icims, taleo, and more (null when none detected)",
                 "example": "greenhouse"
             },
             "direct_apply_url": {
-                "type": "string",
+                "type": [
+                    "string",
+                    "null"
+                ],
                 "title": "Direct Apply URL",
                 "description": "The real company/ATS apply link when detected, otherwise the board listing URL — skips the aggregator where possible",
                 "example": "https://boards.greenhouse.io/acme/jobs/12345"
             },
             "salary_annual_min": {
-                "type": "integer",
+                "type": [
+                    "integer",
+                    "number",
+                    "null"
+                ],
                 "title": "Annual Salary Min",
                 "description": "Minimum salary standardised to an annual figure (daily/hourly/monthly rates annualised) for fair cross-board comparison",
                 "example": 90000
             },
             "salary_annual_max": {
-                "type": "integer",
+                "type": [
+                    "integer",
+                    "number",
+                    "null"
+                ],
                 "title": "Annual Salary Max",
                 "description": "Maximum salary standardised to an annual figure",
                 "example": 110000
             },
             "salary_hourly": {
-                "type": "number",
+                "type": [
+                    "number",
+                    "null"
+                ],
                 "title": "Hourly Salary",
                 "description": "Standardised hourly rate derived from the annual midpoint (2080 work hours/year)",
                 "example": 48.08
@@ -176,13 +223,19 @@
                 "example": true
             },
             "job_type": {
-                "type": "string",
+                "type": [
+                    "string",
+                    "null"
+                ],
                 "title": "Job Type",
                 "description": "Normalized job type — fulltime, parttime, contract or internship (empty when it can't be determined)",
                 "example": "fulltime"
             },
             "posted_at": {
-                "type": "string",
+                "type": [
+                    "string",
+                    "null"
+                ],
                 "title": "Posted At",
                 "description": "Post date normalised to an ISO 8601 UTC timestamp (parsed from absolute or relative dates like '3 days ago')",
                 "example": "2026-07-05T10:00:00+00:00"
