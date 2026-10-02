@@ -207,7 +207,7 @@ Without a key, the USAJobs board is skipped (a warning is logged) — everything
 
 The Actor is built to spend as little as possible by itself:
 
-- **Plain HTTP first, browser only when blocked.** Reed, Totaljobs, CWJobs and GOV.UK all serve their results server-side, so each page costs about a second and a few dozen kilobytes. A headless browser is only launched if a board actually blocks the HTTP request, and only for that board. A typical UK run never starts Chromium at all.
+- **Plain HTTP first, browser only when blocked.** Reed, Totaljobs, CWJobs and CV-Library serve their results server-side, so each page costs about a second and a few dozen kilobytes. A headless browser is only launched for a board that actually blocks the HTTP request (typically Indeed and GOV.UK), and only for that board, so it costs seconds rather than the whole run.
 - **Every board runs at the same time** rather than one after another, so the run takes as long as the slowest board, not the sum of all of them.
 - **Free-API boards never touch a proxy.** RemoteOK, Arbeitnow, The Muse, Remotive, Jobicy, Adzuna, USAJobs (and Reed with an API key) run over a direct connection.
 - **Browser pages are bandwidth-trimmed.** When a browser is needed, images, media, fonts and ad/tracking content are never downloaded, and the page is read as soon as the job cards render.
