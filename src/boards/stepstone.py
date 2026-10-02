@@ -28,7 +28,7 @@ class StepStoneScraper(BaseScraper):
     card_selector = '[data-at="job-item"]'
     page_size = 25
 
-    def __init__(self, client, delay: float = 0.8, **kwargs):
+    def __init__(self, client, delay: float = 1.6, **kwargs):
         super().__init__(client, delay, **kwargs)
         self._page_count: int | None = None
 

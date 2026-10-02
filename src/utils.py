@@ -398,6 +398,11 @@ def make_headers(accept_language: str = "en-GB,en;q=0.9") -> dict:
     }
 
 
+# Search pages normally answer in 1-3 s; a long read timeout only makes
+# tarpits (Akamai holds the connection open) more expensive.
+HTML_TIMEOUT = httpx.Timeout(12.0, connect=10.0)
+
+
 def make_api_headers() -> dict:
     return {"User-Agent": "Mozilla/5.0 (compatible; jobs-board-scraper/1.0)", "Accept": "application/json"}
 
@@ -736,11 +741,15 @@ class BaseScraper(ABC):
     warmup_url: str | None = None         # visited once when the browser context is created
     blocked_resource_types = BLOCKED_RESOURCE_TYPES
     browser_max_attempts: int | None = None  # None -> 2 with a proxy to rotate, else 1
+    browser_attempt_timeout = 75.0        # hard cap per browser page attempt (tarpits hang Playwright)
+    http_retry_rotations = 1              # fresh proxy sessions to try over HTTP before using the browser
 
     def __init__(self, client: httpx.AsyncClient, delay: float = 0.8, *,
                  browser_pool: BrowserPool | None = None, proxy_url: str | None = None,
-                 proxy_config=None, on_page: PageCallback | None = None, browser=None):
+                 proxy_config=None, on_page: PageCallback | None = None, browser=None,
+                 client_headers: dict | None = None):
         self.client = client
+        self._client_headers = client_headers   # set -> this board owns its client and may rebuild it on rotation
         self.delay = delay
         self.browser_pool = browser_pool
         self.proxy_url = proxy_url
@@ -818,6 +827,19 @@ class BaseScraper(ABC):
             jobs, has_next = self._parse_search(html, soup)
             if not jobs and self.use_js_fallback and self._last_browser_extracted:
                 jobs = self._process_js_extracted()
+            if not jobs and self.fetch_mode == "http" and self.browser_pool and page > 1:
+                # An empty page over HTTP right after full ones is usually a
+                # soft block the heuristics missed; one browser look settles it.
+                Actor.log.info(f"[{self.source_name}] page {page} empty over HTTP, checking with the browser")
+                self.fetch_mode = "browser"
+                self.stats["mode"] = "browser"
+                html = await self._fetch_browser(url)
+                if html:
+                    self.stats["browser_pages"] += 1
+                    soup = LazySoup(html)
+                    jobs, has_next = self._parse_search(html, soup)
+                    if not jobs and self.use_js_fallback and self._last_browser_extracted:
+                        jobs = self._process_js_extracted()
             if not jobs:
                 Actor.log.info(f"[{self.source_name}] No jobs on page {page}, stopping")
                 self.exhausted = True
@@ -856,9 +878,17 @@ class BaseScraper(ABC):
     # ── Fetching ─────────────────────────────────────────────────────
 
     async def _get_html(self, url: str) -> str | None:
-        """HTTP first; switch the whole board to browser mode on the first failure."""
+        """HTTP first; on a block, retry HTTP on a fresh proxy session (a rate
+        limit or tarpit is per IP); only then switch the board to the browser."""
         if self.fetch_mode != "browser":
             html = await self._fetch_html_http(url)
+            if not html and self.proxy_config and self._client_headers is not None:
+                for _ in range(self.http_retry_rotations):
+                    await self._rotate_proxy()
+                    html = await self._fetch_html_http(url)
+                    if html:
+                        Actor.log.info(f"[{self.source_name}] fresh proxy session passed over HTTP")
+                        break
             if html:
                 self.fetch_mode = "http"
                 self.stats["mode"] = "http"
@@ -933,9 +963,14 @@ class BaseScraper(ABC):
         for attempt in range(1, max_attempts + 1):
             try:
                 self._last_fetch_salvaged = False
-                html = await self._fetch_browser_once(url)
+                # Hard cap: a tarpitted connection can hang Playwright past its
+                # own navigation timeout, which would eat the board's budget.
+                html = await asyncio.wait_for(self._fetch_browser_once(url), timeout=self.browser_attempt_timeout)
                 if html:
                     return html
+            except asyncio.TimeoutError:
+                Actor.log.warning(f"[{self.source_name}] browser attempt {attempt} hung past {self.browser_attempt_timeout:.0f}s; discarding context")
+                await self.browser_pool.reset_context(self.source_name)
             except Exception as e:
                 Actor.log.warning(f"[{self.source_name}] browser attempt {attempt}: {type(e).__name__}: {str(e)[:120]}")
             if attempt < max_attempts:
@@ -956,8 +991,8 @@ class BaseScraper(ABC):
                     goto_kwargs["referer"] = self.warmup_url
                 try:
                     resp = await page.goto(url, **goto_kwargs)
-                except Exception:
-                    Actor.log.info(f"[{self.source_name}] domcontentloaded timed out, trying load event")
+                except Exception as e:
+                    Actor.log.info(f"[{self.source_name}] navigation failed ({type(e).__name__}), retrying with load event")
                     resp = await page.goto(url, wait_until="load", timeout=20000)
                 status = resp.status if resp else None
                 selector = self.card_selector or 'a[href*="/job"]'
@@ -1000,7 +1035,10 @@ class BaseScraper(ABC):
                         pass
                 return html
             finally:
-                await page.close()
+                try:
+                    await asyncio.wait_for(page.close(), timeout=5)
+                except Exception:
+                    pass
 
     async def _rotate_proxy(self):
         """New proxy session for this board; the warmed browser context is
@@ -1012,6 +1050,14 @@ class BaseScraper(ABC):
         try:
             safe = re.sub(r"[^a-zA-Z0-9._~]", "_", self.source_name)
             self.proxy_url = await self.proxy_config.new_url(session_id=f"{safe}_{random.randint(10000, 99999)}")
+            if self._client_headers is not None:
+                old = self.client
+                self.client = httpx.AsyncClient(headers=self._client_headers, proxy=self.proxy_url,
+                                                timeout=HTML_TIMEOUT, follow_redirects=True)
+                try:
+                    await old.aclose()
+                except Exception:
+                    pass
             Actor.log.info(f"[{self.source_name}] rotated proxy session")
         except Exception as e:
             Actor.log.warning(f"[{self.source_name}] proxy rotation failed: {e}")

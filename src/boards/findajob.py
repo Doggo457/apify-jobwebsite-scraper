@@ -20,11 +20,8 @@ from __future__ import annotations
 import re
 from urllib.parse import quote_plus, urljoin
 
-import httpx
-from apify import Actor
-
 from ..utils import (BaseScraper, apply_salary, clean_text, detect_employment_type,
-                     detect_work_mode, make_headers, parse_salary)
+                     detect_work_mode, parse_salary)
 
 BASE_URL = "https://www.jobs.service.gov.uk"
 JOB_TYPE_PARAM = {"permanent": "jobType=PERMANENT", "temporary": "jobType=TEMPORARY",
@@ -47,27 +44,7 @@ class FindAJobScraper(BaseScraper):
         head = html[:4000]
         return "waf_failover" in head or "Something went wrong" in head or "Access Denied" in head
 
-    async def _fetch_html_http(self, url: str) -> str | None:
-        """Tier 1: the board's client. Tier 2: up to two fresh residential
-        sessions. A single flagged exit IP must not kill the whole board."""
-        html = await super()._fetch_html_http(url)
-        if html:
-            return html
-        if not self.proxy_config:
-            return None
-        for _ in range(2):
-            await self._rotate_proxy()
-            try:
-                async with httpx.AsyncClient(headers=make_headers(), proxy=self.proxy_url,
-                                             timeout=httpx.Timeout(25.0, connect=12.0),
-                                             follow_redirects=True) as c:
-                    r = await c.get(url)
-                    if r.status_code == 200 and not self.page_is_blocked(r.text) and len(r.text) > 3000:
-                        Actor.log.info("[FindAJob] rotated residential session passed the WAF")
-                        return r.text
-            except httpx.HTTPError as e:
-                Actor.log.debug(f"[FindAJob] rotated-session fetch failed: {type(e).__name__}")
-        return None
+    http_retry_rotations = 2   # one flagged exit IP must not kill the board
 
     def _build_url(self, keyword, location, job_type, salary_min, page) -> str:
         params = [f"keywords={quote_plus(keyword)}", f"resultsPerPage={self.page_size}"]

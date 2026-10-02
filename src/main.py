@@ -47,7 +47,7 @@ from .boards.themuse import TheMuseScraper
 from .boards.totaljobs import TotaljobsScraper
 from .boards.usajobs import USAJobsScraper
 from . import pipeline
-from .utils import BrowserPool, make_api_headers, make_headers, normalize_date
+from .utils import HTML_TIMEOUT, BrowserPool, make_api_headers, make_headers, normalize_date
 
 # board -> (factory, kind). "html": proxied HTTP with lazy browser fallback;
 # "api": direct connection, never a browser.
@@ -291,22 +291,32 @@ async def run_board(name: str, scraper, term: str, location: str, limit: int, jo
                                     "mode": "", "secs": 0.0, "error": ""})
     jobs: list[dict] = []
     errored = False
+    buffered: list[dict] = []
+
+    async def _on_page(_src: str, page_jobs: list[dict]) -> None:
+        buffered.extend(page_jobs)
+
+    scraper.on_page = _on_page
     try:
-        jobs = await asyncio.wait_for(
+        returned = await asyncio.wait_for(
             scraper.search(keyword=term, location=location, max_results=limit,
                            job_type=job_type, salary_min=salary_min),
             timeout=timeout) or []
+        jobs = buffered if buffered else returned
     except asyncio.TimeoutError:
-        entry["error"] = f"timeout after {timeout:.0f}s"
+        jobs = buffered   # pages already fetched are kept
+        entry["error"] = f"timeout after {timeout:.0f}s ({len(jobs)} jobs kept)"
         scraper.exhausted = True
         errored = True
         Actor.log.warning(f"[{scraper.source_name}] '{term}': {entry['error']}")
     except Exception as e:  # one broken board must never sink the run
+        jobs = buffered
         entry["error"] = f"{type(e).__name__}: {str(e)[:160]}"
         scraper.exhausted = True
         errored = True
         Actor.log.exception(f"[{scraper.source_name}] failed on '{term}'")
     finally:
+        scraper.on_page = None
         if not getattr(scraper, "resumable", True):
             scraper.exhausted = True
         entry["jobs"] += len(jobs)
@@ -422,11 +432,11 @@ async def main() -> None:
                 proxy_url = None
                 if proxy_config:
                     proxy_url = await proxy_config.new_url(session_id=f"{board}_{random.randint(1000, 9999)}")
-                client = httpx.AsyncClient(headers=make_headers(ACCEPT_LANGUAGE.get(country, "en-GB,en;q=0.9")),
-                                           proxy=proxy_url, timeout=httpx.Timeout(25.0, connect=12.0),
-                                           follow_redirects=True)
+                headers = make_headers(ACCEPT_LANGUAGE.get(country, "en-GB,en;q=0.9"))
+                client = httpx.AsyncClient(headers=headers, proxy=proxy_url, timeout=HTML_TIMEOUT, follow_redirects=True)
                 clients.append(client)
-                extra.update(browser_pool=browser_pool, proxy_url=proxy_url, proxy_config=proxy_config)
+                extra.update(browser_pool=browser_pool, proxy_url=proxy_url, proxy_config=proxy_config,
+                             client_headers=headers)
             else:
                 client = api_client
                 if board == "adzuna":
@@ -443,7 +453,9 @@ async def main() -> None:
             scrapers[board] = scraper
 
         pages_needed = math.ceil(max_per_board / 25)
-        board_timeout = 1800.0 if unlimited else float(max(150, min(900, 60 + 15 * pages_needed)))
+        # Budget per board per term. Partial results survive a timeout, so this
+        # bounds cost rather than deciding what the customer gets.
+        board_timeout = 1800.0 if unlimited else float(max(180, min(900, 120 + 20 * pages_needed)))
         stats: dict[str, dict] = {}
         t_start = time.perf_counter()
 
