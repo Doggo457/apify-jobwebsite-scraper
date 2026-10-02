@@ -4,7 +4,7 @@
     "title": "Jobs Board Scraper: Indeed, Reed, Adzuna, RemoteOK & More",
     "description": "Scrape job listings from Indeed, Reed, Totaljobs, CV-Library, Adzuna, RemoteOK, Arbeitnow and more across the UK, US and Europe. Export title, company, location, salary, description and apply URL. Filter by keyword and location. CSV, JSON, Excel.",
     "version": "0.12",
-    "buildTag": "experimental",
+    "buildTag": "latest",
     "minMemoryMbytes": 1024,
     "maxMemoryMbytes": 4096,
     "defaultMemoryMbytes": 2048,
