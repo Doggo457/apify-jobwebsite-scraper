@@ -139,5 +139,24 @@ else:
         check(f"schema-valid {r.get('source') or r.get('_type')}", not errs, "; ".join(errs)[:200])
     check("ats null is allowed", "null" in schema["fields"]["properties"]["ats"]["type"])
 
+# ── v0.12: top-up counts against the deduplicated total ──
+print("Merged count")
+import copy  # noqa: E402
+import random  # noqa: E402
+rng = random.Random(7)
+boards = ["reed.co.uk", "totaljobs.com", "cv-library.co.uk", "jobs.service.gov.uk"]
+sample = []
+for i in range(400):
+    k = rng.randrange(120)   # 120 distinct roles spread over 400 listings => plenty of dupes
+    b = rng.choice(boards)
+    sample.append(job(source=b, url=f"https://{b}/job/{i}", title=f"Engineer {k}", company=f"Firm {k % 37} Ltd",
+                      location=rng.choice(["London", "Greater London", "Manchester", ""])))
+sample.append(job(source="reed.co.uk", url="https://reed/nocompany", company=""))
+expected = len(pipeline.merge_jobs(copy.deepcopy(sample)))
+check("merged_count == len(merge_jobs) with dedup", pipeline.merged_count(sample, True) == expected,
+      f"{pipeline.merged_count(sample, True)} vs {expected}")
+check("merged_count == len(jobs) without dedup", pipeline.merged_count(sample, False) == len(sample))
+check("merged_count leaves jobs untouched", "sources" not in sample[0])
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

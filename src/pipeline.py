@@ -650,6 +650,29 @@ def _merge_into(base: dict, job: dict, src: dict) -> None:
         base["source_count"] = len(base["sources"])
 
 
+def merged_count(jobs: list[dict], do_merge: bool = True) -> int:
+    """How many records merge_jobs() would produce, without touching the jobs.
+    Mirrors its identity rule exactly (cross-board merge on the fingerprint,
+    same-board listings kept separate) so the collector can top up against
+    the DEDUPLICATED total rather than the raw one."""
+    if not do_merge:
+        return len(jobs)
+    boards_by_fp: dict[str, set[str]] = {}
+    keys: set[str] = set()
+    for idx, job in enumerate(jobs):
+        fp = job_fingerprint(job) or f"__uniq_{idx}__"
+        board = job.get("source", "")
+        boards = boards_by_fp.get(fp)
+        if boards is None:
+            boards_by_fp[fp] = {board}
+            keys.add(fp)
+        elif board in boards:
+            keys.add(f"{fp}##{job.get('url') or job.get('job_id') or idx}")
+        else:
+            boards.add(board)
+    return len(keys)
+
+
 def merge_jobs(jobs: list[dict], do_merge: bool = True) -> list[dict]:
     """Collapse CROSS-BOARD duplicates into single records that cite every
     source. Distinct same-board listings (different URLs) stay separate."""

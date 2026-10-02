@@ -592,20 +592,33 @@ async def main() -> None:
 
             # ── Top-up: if boards came up short, ask the ones that still have
             # pages for the difference (cheap: HTTP pages). Resumes from the
-            # page each board stopped at for the last search term.
-            if not unlimited and len(raw_jobs) < max_results:
+            # page each board stopped at for the last search term. The target
+            # is measured AFTER cross-board dedup (what the customer receives),
+            # scaled by the duplicate rate seen so far, up to two rounds.
+            for _round in range(2):
+                if unlimited:
+                    break
+                unique_now = pipeline.merged_count(raw_jobs, deduplicate)
+                if unique_now >= max_results:
+                    break
                 live = [n for n, s in scrapers.items()
                         if not s.exhausted and n not in dead_boards and getattr(s, "resumable", True)]
-                deficit = max_results - len(raw_jobs)
-                if live:
-                    extra = math.ceil(deficit * 1.25 / len(live))
-                    Actor.log.info(f"Top-up: {len(raw_jobs)}/{max_results} collected, asking {live} for ~{extra} more each")
-                    for n in live:
-                        s = scrapers[n]
-                        s.max_pages = min(max_pages, s.max_pages + math.ceil(extra / s.page_size) + 1)
-                        if s.hard_page_cap:
-                            s.max_pages = min(s.max_pages, s.hard_page_cap)
-                    await collect_term(search_terms[-1], limit_override=extra, only=live)
+                if not live:
+                    break
+                deficit = max_results - unique_now
+                keep_rate = unique_now / len(raw_jobs) if raw_jobs else 1.0   # share of raw rows that survive dedup
+                extra = math.ceil(deficit / max(0.5, keep_rate) * 1.1 / len(live))
+                Actor.log.info(f"Top-up {_round + 1}: {unique_now} unique of {len(raw_jobs)} raw (target {max_results}), "
+                               f"asking {live} for ~{extra} more each")
+                for n in live:
+                    s = scrapers[n]
+                    s.max_pages = min(max_pages, s.max_pages + math.ceil(extra / s.page_size) + 1)
+                    if s.hard_page_cap:
+                        s.max_pages = min(s.max_pages, s.hard_page_cap)
+                before = len(raw_jobs)
+                await collect_term(search_terms[-1], limit_override=extra, only=live)
+                if len(raw_jobs) == before:
+                    break   # nothing new came back; another round would only burn time
 
             Actor.log.info(f"Collected {len(raw_jobs)} raw jobs across {len(search_terms)} term(s)")
 
