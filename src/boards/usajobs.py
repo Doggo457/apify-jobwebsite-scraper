@@ -21,10 +21,10 @@ class USAJobsScraper(BaseScraper):
     default_currency = "USD"
     page_size = 100
 
-    def __init__(self, client, delay: float = 0.3, api_key: str = "", user_email: str = "", **kwargs):
+    def __init__(self, client, delay: float = 0.3, api_key: str = "", user_email: str = "", email: str = "", **kwargs):
         super().__init__(client, delay, **kwargs)
         self.api_key = (api_key or "").strip()
-        self.user_email = (user_email or "").strip() or "jobs-board-scraper@apify.com"
+        self.user_email = (user_email or email or "").strip() or "jobs-board-scraper@apify.com"
 
     @property
     def source_name(self) -> str:

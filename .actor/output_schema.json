@@ -1,11 +1,11 @@
 {
     "actorOutputSchemaVersion": 1,
-    "title": "UK Jobs Board Scraper Output",
-    "description": "Job listings scraped from up to 7 UK job boards, deduplicated and structured.",
+    "title": "Jobs Board Scraper: Indeed, Reed, Adzuna, RemoteOK & More",
+    "description": "Job listings from 17+ job boards across the UK, US, EU and remote markets — cross-board duplicates merged into single records that cite every source, with ATS/direct-apply detection, standardised salary insights (annual + hourly), remote & job-type flags, and normalised post dates.",
     "properties": {
         "jobListings": {
             "title": "Job Listings",
-            "description": "Structured job data from all selected boards",
+            "description": "Structured, deduplicated job data from all selected boards — each record includes sources[], source_count, ats, direct_apply_url, salary_annual_min/max, salary_hourly, is_remote, job_type and posted_at.",
             "type": "string",
             "template": "{{links.apiDefaultDatasetUrl}}/items"
         }

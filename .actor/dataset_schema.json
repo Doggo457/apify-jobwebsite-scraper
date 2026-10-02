@@ -29,7 +29,7 @@
             },
             "salary_min": {
                 "type": [
-                    "integer",
+                    "number",
                     "null"
                 ],
                 "title": "Salary Min",
@@ -38,7 +38,7 @@
             },
             "salary_max": {
                 "type": [
-                    "integer",
+                    "number",
                     "null"
                 ],
                 "title": "Salary Max",
@@ -47,8 +47,8 @@
             },
             "salary_currency": {
                 "type": "string",
-                "title": "Currency",
-                "description": "ISO currency code of the parsed salary (GBP, USD, EUR, AUD)",
+                "title": "Salary Currency",
+                "description": "ISO currency code, based on the job's source country — GBP, USD, EUR, or AUD",
                 "example": "GBP"
             },
             "salary_period": {
@@ -66,7 +66,7 @@
             "work_mode": {
                 "type": "string",
                 "title": "Work Mode",
-                "description": "Remote, Hybrid or On-site where the listing states it",
+                "description": "Remote, Hybrid or On-site where the listing states it (empty when not stated)",
                 "example": "Hybrid"
             },
             "snippet": {
@@ -78,13 +78,13 @@
             "date_posted": {
                 "type": "string",
                 "title": "Date Posted",
-                "description": "When the job was listed, normalised to ISO date (YYYY-MM-DD) wherever the board gives a readable date",
+                "description": "When the job was listed, normalised to an ISO date (YYYY-MM-DD) wherever the board gives a readable date; see posted_at for the full timestamp",
                 "example": "2026-03-05"
             },
             "valid_through": {
                 "type": "string",
                 "title": "Valid Through",
-                "description": "Application deadline or listing expiry (ISO date where available)",
+                "description": "Application deadline (where available)",
                 "example": "2026-04-05"
             },
             "url": {
@@ -102,14 +102,90 @@
             "source": {
                 "type": "string",
                 "title": "Source",
-                "description": "Which job board the listing came from (reed.co.uk, totaljobs.com, cwjobs.co.uk, cv-library.co.uk, indeed.co.uk, jobs.service.gov.uk, usajobs.gov, adzuna.gb, remoteok.com, arbeitnow.com, ...)",
+                "description": "Which job board the listing came from",
                 "example": "reed.co.uk"
             },
             "category": {
                 "type": "string",
                 "title": "Category",
-                "description": "Job category: from the board where it provides one (Adzuna, USAJobs), otherwise inferred from the title",
-                "example": "Software Development"
+                "description": "Job category — from the board where provided (e.g. Adzuna), otherwise inferred from the job title",
+                "example": "IT Jobs"
+            },
+            "description": {
+                "type": "string",
+                "title": "Description",
+                "description": "Full job description, formatted as Markdown (default), HTML or plain text per the Description Format input",
+                "example": "**About the role**\n\nWe are looking for a passionate engineer..."
+            },
+            "sources": {
+                "type": "array",
+                "title": "Sources",
+                "description": "Every board this exact job was found on, as {board, url}. One role seen on 3 boards becomes one record citing all 3.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "board": {
+                            "type": "string"
+                        },
+                        "url": {
+                            "type": "string"
+                        }
+                    }
+                }
+            },
+            "source_count": {
+                "type": "integer",
+                "title": "Source Count",
+                "description": "How many boards this merged job appeared on (1 = seen on a single board)",
+                "example": 3
+            },
+            "ats": {
+                "type": "string",
+                "title": "ATS",
+                "description": "Applicant Tracking System detected from the apply URL — greenhouse, lever, ashby, workday, workable, smartrecruiters, icims, taleo, and more (null when none detected)",
+                "example": "greenhouse"
+            },
+            "direct_apply_url": {
+                "type": "string",
+                "title": "Direct Apply URL",
+                "description": "The real company/ATS apply link when detected, otherwise the board listing URL — skips the aggregator where possible",
+                "example": "https://boards.greenhouse.io/acme/jobs/12345"
+            },
+            "salary_annual_min": {
+                "type": "integer",
+                "title": "Annual Salary Min",
+                "description": "Minimum salary standardised to an annual figure (daily/hourly/monthly rates annualised) for fair cross-board comparison",
+                "example": 90000
+            },
+            "salary_annual_max": {
+                "type": "integer",
+                "title": "Annual Salary Max",
+                "description": "Maximum salary standardised to an annual figure",
+                "example": 110000
+            },
+            "salary_hourly": {
+                "type": "number",
+                "title": "Hourly Salary",
+                "description": "Standardised hourly rate derived from the annual midpoint (2080 work hours/year)",
+                "example": 48.08
+            },
+            "is_remote": {
+                "type": "boolean",
+                "title": "Remote",
+                "description": "True when the role is remote (from location, title or a remote-first source board)",
+                "example": true
+            },
+            "job_type": {
+                "type": "string",
+                "title": "Job Type",
+                "description": "Normalized job type — fulltime, parttime, contract or internship (empty when it can't be determined)",
+                "example": "fulltime"
+            },
+            "posted_at": {
+                "type": "string",
+                "title": "Posted At",
+                "description": "Post date normalised to an ISO 8601 UTC timestamp (parsed from absolute or relative dates like '3 days ago')",
+                "example": "2026-07-05T10:00:00+00:00"
             },
             "_type": {
                 "type": "string",
@@ -164,15 +240,17 @@
                     "company",
                     "location",
                     "salary_raw",
-                    "salary_min",
-                    "salary_max",
-                    "salary_currency",
-                    "employment_type",
+                    "salary_annual_min",
+                    "salary_annual_max",
+                    "job_type",
+                    "is_remote",
                     "work_mode",
-                    "date_posted",
+                    "ats",
+                    "direct_apply_url",
+                    "source_count",
+                    "posted_at",
                     "url",
                     "source",
-                    "category",
                     "snippet"
                 ]
             },
@@ -195,27 +273,39 @@
                         "label": "Salary",
                         "format": "text"
                     },
-                    "salary_min": {
-                        "label": "Min",
+                    "salary_annual_min": {
+                        "label": "Annual Min",
                         "format": "number"
                     },
-                    "salary_max": {
-                        "label": "Max",
+                    "salary_annual_max": {
+                        "label": "Annual Max",
                         "format": "number"
                     },
-                    "salary_currency": {
-                        "label": "Currency",
-                        "format": "text"
-                    },
-                    "employment_type": {
+                    "job_type": {
                         "label": "Type",
                         "format": "text"
+                    },
+                    "is_remote": {
+                        "label": "Remote",
+                        "format": "boolean"
                     },
                     "work_mode": {
                         "label": "Work Mode",
                         "format": "text"
                     },
-                    "date_posted": {
+                    "ats": {
+                        "label": "ATS",
+                        "format": "text"
+                    },
+                    "direct_apply_url": {
+                        "label": "Apply",
+                        "format": "link"
+                    },
+                    "source_count": {
+                        "label": "Sources",
+                        "format": "number"
+                    },
+                    "posted_at": {
                         "label": "Posted",
                         "format": "text"
                     },
@@ -225,10 +315,6 @@
                     },
                     "source": {
                         "label": "Source",
-                        "format": "text"
-                    },
-                    "category": {
-                        "label": "Category",
                         "format": "text"
                     },
                     "snippet": {

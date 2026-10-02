@@ -1,19 +1,24 @@
 """
-Shared utilities for the International Jobs Board scrapers.
+Shared utilities for the Jobs Board Scraper boards.
 
-Design goals (cost on Apify = memory x wall-clock + proxy bandwidth):
-  * HTTP first. Every board tries a plain httpx request before touching a
-    browser. A search page over HTTP is ~50-100 KB on the wire and takes
-    ~1 s; the same page in Chromium is 1-3 MB and 10-60 s.
-  * Lazy browser. Chromium is only launched when a board actually needs it
-    (blocked / thin / JS-only page), and never when all boards are HTTP-OK.
-  * One browser context per board, not per page. Cookies and the proxy
-    session persist across pagination, which both looks more human and
-    avoids paying 300-500 ms of context setup per page.
-  * No fixed sleeps in the browser path. We wait for the job-card selector,
-    not for "networkidle" plus an arbitrary 3-5 s.
-  * Parse HTML once with lxml. The old code built a BeautifulSoup tree with
-    html.parser three or four times per page.
+Cost on Apify = memory x wall-clock + residential-proxy GB, so the fetch layer
+is built around four rules:
+
+  * HTTP first. Every board tries a plain httpx request before any browser.
+    A search page over HTTP is ~50-100 KB on the wire and takes ~1 s; the same
+    page in Chromium is 1-3 MB and 10-60 s. Reed, Totaljobs, CWJobs and GOV.UK
+    all serve their results server-side, so a typical UK run never needs it.
+  * Lazy browser. Chromium is launched only when a board is actually blocked
+    over HTTP (bot wall / soft-404 / thin page), and only for that board.
+  * One browser context per board, warmed once, reused for every page: the
+    cookie jar and proxy session persist across pagination, which scores
+    better with Cloudflare Bot Management than a cold context per page and
+    avoids paying 300-500 ms of context setup each time.
+  * No fixed sleeps. We wait for the job-card selector, not "networkidle".
+
+Board-specific anti-bot hooks (page_is_blocked / on_blocked_page) and the
+per-board browser knobs are kept from v0.11 so Reed's soft-404 salvage and the
+GOV.UK WAF handling still work on the rare browser path.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import json
 import random
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Awaitable, Callable, Optional
 from urllib.parse import urlparse
@@ -32,7 +38,7 @@ from apify import Actor
 from bs4 import BeautifulSoup
 
 # ──────────────────────────────────────────────────────────────────────
-# Browser helpers
+# Browser constants
 # ──────────────────────────────────────────────────────────────────────
 
 CHROME_UA = (
@@ -56,7 +62,8 @@ STEALTH_ARGS = [
     "--window-size=1366,900",
 ]
 
-# Injected before any page script runs.
+# Injected before any page script runs (boards behind Cloudflare Bot
+# Management opt out via use_stealth_js = False: tampered natives score worse).
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', { get: () => false });
 Object.defineProperty(navigator, 'plugins', { get: () => [
@@ -78,61 +85,121 @@ window.navigator.permissions.query = (p) => (
 );
 """
 
-# Generic in-page extractor used only as a last-resort fallback when a
-# board's own parser finds nothing in the rendered DOM.
+# Generic in-page extractor: reads visible job cards from the rendered DOM.
+# Last-resort fallback when a board's own parser finds nothing.
 JS_EXTRACT_JOBS = """
 (() => {
     const jobs = [];
     const selectors = [
-        'article', '[data-testid*="job"]', '[data-at="job-item"]',
-        '[class*="JobCard"]', '[class*="job-card"]', '[class*="job-result"]',
-        '[class*="search-result"]', 'li[class*="job"]',
+        '[data-testid*="job"]', 'article', '[data-at="job-item"]',
+        '[class*="JobCard"]', '[class*="job-card"]',
+        '[class*="SearchResult"]', '[class*="search-result"]',
+        '[class*="job-result"]', 'li[class*="job"]',
     ];
     let cards = [];
     for (const sel of selectors) {
         const found = document.querySelectorAll(sel);
         if (found.length > cards.length) cards = found;
     }
+    if (cards.length < 2) {
+        const allLinks = document.querySelectorAll('a[href*="/job/"]');
+        const parents = new Set();
+        for (const a of allLinks) {
+            if (a.parentElement && a.parentElement.parentElement) parents.add(a.parentElement.parentElement);
+        }
+        if (parents.size > 2) cards = parents;
+    }
     for (const card of cards) {
+        const allLinks = card.querySelectorAll('a');
         let titleLink = null;
-        for (const a of card.querySelectorAll('a[href]')) {
-            const t = (a.innerText || a.textContent || '').trim();
-            if (t.length > 3 && t.length < 200 && /\\/(job|jobs|details|viewjob)/.test(a.href)) { titleLink = a; break; }
+        for (const a of allLinks) {
+            const text = (a.innerText || a.textContent || '').trim();
+            if (text.length > 3 && text.length < 200 && a.href &&
+                (a.href.includes('/job/') || a.href.includes('/jobs/') || a.href.includes('viewjob'))) { titleLink = a; break; }
+        }
+        if (!titleLink) {
+            for (const a of allLinks) {
+                const text = (a.innerText || a.textContent || '').trim();
+                if (text.length > 5 && text.length < 200 && a.href) { titleLink = a; break; }
+            }
         }
         if (!titleLink) continue;
         const title = (titleLink.innerText || titleLink.textContent || '').trim();
-        if (title.length < 3) continue;
-        jobs.push({
-            title,
-            url: titleLink.href,
-            _card_text: (card.innerText || card.textContent || '').substring(0, 1500),
-        });
+        if (!title || title.length < 3) continue;
+        const job = { title: title, url: titleLink.href || '' };
+        const idMatch = job.url.match(/\\/job\\/(\\d+)/) || job.url.match(/-job(\\d+)/) || job.url.match(/\\/(\\d{5,})/);
+        if (idMatch) job.job_id = idMatch[1];
+        job._card_text = (card.innerText || card.textContent || '').substring(0, 2000);
+        const segments = [];
+        const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT, null, false);
+        let node;
+        while (node = walker.nextNode()) {
+            const text = node.textContent.trim();
+            if (text.length > 1 && text.length < 300 && text !== title) segments.push(text);
+        }
+        job._segments = segments.slice(0, 30);
+        for (const a of allLinks) {
+            if (a === titleLink) continue;
+            const href = a.href || '';
+            const text = (a.innerText || a.textContent || '').trim();
+            if (text.length > 1 && text.length < 100 &&
+                (href.includes('/company/') || href.includes('/employer/') ||
+                 href.includes('/recruiter/') || href.includes('/list-jobs/'))) { job._company_link_text = text; break; }
+        }
+        jobs.push(job);
     }
     return jobs;
 })()
 """
 
-BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font", "stylesheet", "texttrack", "manifest"})
+# ── Aggressive resource blocking (residential proxy is billed PER GB) ───
+# Images/media/fonts/CSS are ~90% of page bytes but carry no job data.
+# Never add: document, script (JS-rendered boards), xhr/fetch (job JSON).
+BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font", "stylesheet"})
+
+# Ad / analytics / tracking / consent / session-replay / chat-widget hosts,
+# matched as substrings of the full request URL for every resource type.
+# Never add first-party job-board hosts or Cloudflare challenge paths.
 BLOCKED_URL_PATTERNS = (
-    "google-analytics", "googletagmanager", "doubleclick", "facebook.net",
-    "hotjar", "segment.io", "optimizely", "newrelic", "sentry.io", "fullstory",
-    "adsystem", "criteo", "taboola", "outbrain", "clarity.ms", "bing.com/bat",
-    "cookielaw", "onetrust", "usercentrics", "trustarc",
+    "google-analytics", "googletagmanager", "googlesyndication", "googleadservices",
+    "doubleclick", "adservice.google", "googleoptimize", "google.com/pagead", "imasdk.googleapis",
+    "facebook.net", "connect.facebook", "facebook.com/tr",
+    "bat.bing", "clarity.ms", "snap.licdn", "px.ads.linkedin", "analytics.tiktok", "ads-twitter",
+    "ct.pinterest", "events.redditmedia", "sc-static.net", "tr.snapchat", "mc.yandex",
+    "hotjar", "mixpanel", "segment.io", "segment.com", "amplitude", "heapanalytics", "fullstory",
+    "mouseflow", "crazyegg", "kissmetrics", "quantummetric", "inspectlet", "smartlook",
+    "luckyorange", "chartbeat", "matomo", "plausible.io", "statcounter",
+    "newrelic", "nr-data.net", "sentry.io", "bugsnag", "datadoghq", "rollbar", "speedcurve", "dynatrace",
+    "optimizely", "vwo.com", "visualwebsiteoptimizer", "abtasty", "kameleoon",
+    "adsystem", "adservice", "adnxs", "criteo", "taboola", "outbrain", "scorecardresearch",
+    "quantserve", "quantcount", "pubmatic", "rubiconproject", "openx.net", "casalemedia",
+    "smartadserver", "teads.tv", "yieldlab", "moatads", "adsafeprotected", "doubleverify",
+    "adsrvr.org", "mathtag", "bidswitch", "sharethrough", "gumgum", "33across", "indexww",
+    "sonobi", "adform.net",
+    "id5-sync", "permutive", "liveramp", "krxd.net", "bluekai", "demdex", "everesttech",
+    "agkn.com", "rlcdn.com", "tapad.com", "crwdcntrl", "exelator", "eyeota",
+    "cdn.cookielaw", "onetrust", "cookiebot", "usercentrics", "trustarc", "consensu.org",
+    "sourcepoint", "quantcast",
+    "tiqcdn.com", "ensighten", "adobedtm", "omtrdc.net", "branch.io", "appsflyer", "adjust.com",
+    "intercom.io", "intercomcdn", "livechatinc", "tawk.to", "drift.com", "zdassets", "zopim",
+    "onesignal", "pushwoosh", "liveperson", "salesforceliveagent",
+    "youtube.com/embed", "youtube-nocookie", "player.vimeo", "brightcove", "jwplayer", "jwpcdn",
+    "fonts.googleapis", "fonts.gstatic", "use.typekit", "fast.fonts.net",
 )
 
 CHALLENGE_TITLE_WORDS = (
     "just a moment", "challenge", "attention required", "access denied",
     "security check", "pardon our interruption", "blocked", "are you a human",
-    "request unsuccessful", "verify you are", "bot detection",
+    "request unsuccessful", "verify you are", "bot detection", "something went wrong",
 )
 
 
 def is_challenge_page(title: str, status: int | None, body_len: int, keyword: str = "") -> bool:
     """Heuristic: is this a bot-wall rather than a results page?
 
-    The title words are only trusted on small bodies, and the search keyword
-    is removed from the title first, so a genuine results page like "Blocked
-    Drain Engineer Jobs in London" (800 KB) is not mistaken for Cloudflare.
+    Title words are only trusted on small bodies, and the search keyword is
+    removed first, so a genuine results page like "Blocked Drain Engineer Jobs
+    in London" (800 KB) is never mistaken for Cloudflare.
     """
     if status in (401, 403, 406, 429, 503):
         return True
@@ -144,11 +211,25 @@ def is_challenge_page(title: str, status: int | None, body_len: int, keyword: st
     return body_len < 200_000 and any(w in t for w in CHALLENGE_TITLE_WORDS)
 
 
+def parse_proxy_url(proxy_url: str) -> dict:
+    p = urlparse(proxy_url)
+    d = {"server": f"{p.scheme}://{p.hostname}:{p.port}"}
+    if p.username:
+        d["username"] = p.username
+    if p.password:
+        d["password"] = p.password
+    return d
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Browser pool (lazy Chromium, one warmed context per board)
+# ──────────────────────────────────────────────────────────────────────
+
 class BrowserPool:
     """Lazily launched Chromium with one persistent context per board.
 
-    Nothing is started until the first `context()` call, so runs whose boards
-    all succeed over HTTP never pay for a browser at all.
+    Nothing starts until the first `context()` call, so runs whose boards all
+    succeed over HTTP never pay for a browser at all.
     """
 
     def __init__(self, proxy_config=None, max_concurrent_pages: int = 3):
@@ -173,7 +254,7 @@ class BrowserPool:
             launch_kwargs = {"headless": True, "args": STEALTH_ARGS}
             if self.proxy_config:
                 # Chromium needs a browser-level proxy before per-context
-                # proxies are honoured; the actual per-board proxy is set on
+                # proxies are honoured; the real per-board proxy is set on
                 # the context.
                 seed = await self.proxy_config.new_url(session_id=f"seed_{random.randint(1000, 9999)}")
                 launch_kwargs["proxy"] = parse_proxy_url(seed)
@@ -181,22 +262,70 @@ class BrowserPool:
             self.launched = True
             return self._browser
 
-    async def context(self, key: str, proxy_url: str | None):
+    @property
+    def version(self) -> str:
+        try:
+            return self._browser.version if self._browser else ""
+        except Exception:
+            return ""
+
+    async def context(self, scraper: "BaseScraper"):
+        key = scraper.source_name
         ctx = self._contexts.get(key)
         if ctx:
             return ctx
         browser = await self._ensure_browser()
+        ua = CHROME_UA
+        if scraper.ua_from_browser_version:
+            try:
+                major = browser.version.split(".")[0]
+                ua = (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36")
+            except Exception:
+                pass
         ctx = await browser.new_context(
-            proxy=parse_proxy_url(proxy_url) if proxy_url else None,
+            proxy=parse_proxy_url(scraper.proxy_url) if scraper.proxy_url else None,
             viewport={"width": 1366, "height": 900},
-            user_agent=CHROME_UA,
+            user_agent=ua,
             locale="en-GB",
             timezone_id="Europe/London",
+            java_script_enabled=True,
             bypass_csp=True,
         )
-        await ctx.add_init_script(STEALTH_JS)
-        await ctx.route("**/*", _block_route)
+        if scraper.use_stealth_js:
+            await ctx.add_init_script(STEALTH_JS)
+        blocked_types = frozenset(scraper.blocked_resource_types)
+
+        async def _route(route):
+            req = route.request
+            if req.resource_type in blocked_types:
+                await route.abort()
+                return
+            url = req.url.lower()
+            for pat in BLOCKED_URL_PATTERNS:
+                if pat in url:
+                    await route.abort()
+                    return
+            await route.continue_()
+
+        await ctx.route("**/*", _route)
         self._contexts[key] = ctx
+
+        # Warm-up: land on a page the site serves freely (homepage) so anti-bot
+        # cookies are established, then navigate like a real user would.
+        if scraper.warmup_url:
+            page = await ctx.new_page()
+            try:
+                Actor.log.info(f"[{key}] warm-up visit: {scraper.warmup_url}")
+                await page.goto(scraper.warmup_url, wait_until="domcontentloaded", timeout=25000)
+                await page.wait_for_timeout(1500 + random.randint(0, 1000))
+                await page.mouse.move(400 + random.randint(0, 400), 300 + random.randint(0, 200))
+                await page.mouse.wheel(0, 500 + random.randint(0, 400))
+                await page.wait_for_timeout(500 + random.randint(0, 500))
+            except Exception as e:
+                Actor.log.debug(f"[{key}] warm-up failed (continuing): {e}")
+            finally:
+                await page.close()
         return ctx
 
     async def reset_context(self, key: str):
@@ -232,29 +361,6 @@ class BrowserPool:
             self._pw = None
 
 
-async def _block_route(route):
-    req = route.request
-    if req.resource_type in BLOCKED_RESOURCE_TYPES:
-        await route.abort()
-        return
-    url = req.url
-    for pat in BLOCKED_URL_PATTERNS:
-        if pat in url:
-            await route.abort()
-            return
-    await route.continue_()
-
-
-def parse_proxy_url(proxy_url: str) -> dict:
-    p = urlparse(proxy_url)
-    d = {"server": f"{p.scheme}://{p.hostname}:{p.port}"}
-    if p.username:
-        d["username"] = p.username
-    if p.password:
-        d["password"] = p.password
-    return d
-
-
 # ──────────────────────────────────────────────────────────────────────
 # Text / value helpers
 # ──────────────────────────────────────────────────────────────────────
@@ -265,16 +371,20 @@ _WS = re.compile(r"\s+")
 def clean_text(text: str | None) -> str:
     if not text:
         return ""
-    return _WS.sub(" ", text).strip()
+    return _WS.sub(" ", str(text)).strip()
 
 
 def make_headers(accept_language: str = "en-GB,en;q=0.9") -> dict:
-    """Realistic Chrome request headers for HTML boards."""
-    # Accept-Encoding is deliberately left to httpx, which advertises only the
-    # codecs it can actually decode (brotli via the httpx[brotli] extra).
+    """Realistic Chrome request headers for HTML boards.
+
+    A Chrome UA without matching sec-ch-ua client hints gets failover pages
+    from some WAFs (GOV.UK), so the full consistent set is sent. Accept-Encoding
+    is left to httpx, which advertises only the codecs it can decode.
+    """
     return {
         "User-Agent": CHROME_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+                   "image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
         "Accept-Language": accept_language,
         "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
         "Sec-Ch-Ua-Mobile": "?0",
@@ -313,6 +423,34 @@ class LazySoup:
         if self._soup is None:
             self._soup = make_soup(self._html)
         return getattr(self._soup, name)
+
+
+def _as_soup(html_or_soup) -> BeautifulSoup | LazySoup:
+    return html_or_soup if hasattr(html_or_soup, "select") else LazySoup(html_or_soup or "")
+
+
+@dataclass
+class JobListing:
+    """Unified job listing format (kept for import compatibility)."""
+    title: str = ""
+    company: str = ""
+    location: str = ""
+    salary_raw: str = ""
+    salary_min: Optional[float] = None
+    salary_max: Optional[float] = None
+    salary_currency: str = ""
+    salary_period: str = "annum"
+    snippet: str = ""
+    full_description: str = ""
+    employment_type: str = ""
+    date_posted: str = ""
+    valid_through: str = ""
+    url: str = ""
+    job_id: str = ""
+    source: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 CURRENCY_SYMBOL = {"GBP": "£", "USD": "$", "EUR": "€", "AUD": "A$"}
@@ -390,27 +528,24 @@ def annualise(amount: float | None, period: str) -> float | None:
 _MONTHS = {m: i for i, m in enumerate(
     ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
 _REL = re.compile(r"(\d+)\s*\+?\s*(minute|min|hour|hr|day|week|month)s?\s*ago", re.IGNORECASE)
-# German / French / Dutch relative dates seen on Indeed DE/FR/NL
 _REL_EU = re.compile(r"(?:vor|il y a|geleden)?\s*(\d+)\s*\+?\s*(tag|tage|tagen|jour|jours|dag|dagen|woche|wochen|semaine|semaines|week|weken)\b", re.IGNORECASE)
 _DMY = re.compile(r"\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})\b")
 _DM = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]{3,9})\.?(?:\s+(\d{4}))?", re.IGNORECASE)
 _MD = re.compile(r"\b([a-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?", re.IGNORECASE)
 
 
-def normalize_date(text: str | None, today: date | None = None, future_ok: bool = False) -> str:
+def normalize_date(text, today: date | None = None, future_ok: bool = False) -> str:
     """Return an ISO date (YYYY-MM-DD) for the many formats boards use, or ''.
 
     Handles ISO timestamps, "today", "yesterday", "3 days ago", "2 weeks ago",
     "18 September", "Sep 18, 2026", "18/09/2026" (day-first), epoch seconds or
-    milliseconds, and German/French/Dutch relative phrases.
-
-    A day-month string with no year is assumed to be in the past (a posting
-    date) unless `future_ok` is set (a closing date), in which case it is
-    assumed to be the next occurrence.
+    milliseconds, and German/French/Dutch relative phrases. A day-month string
+    with no year is assumed past (a posting date) unless `future_ok` is set
+    (a closing date), in which case it is the next occurrence.
     """
     if text is None:
         return ""
-    if isinstance(text, (int, float)):
+    if isinstance(text, (int, float)) and not isinstance(text, bool):
         try:
             ts = float(text)
             if ts > 1e11:  # milliseconds
@@ -506,7 +641,7 @@ def detect_work_mode(*texts: str | None) -> str:
     for t in texts:
         if not t:
             continue
-        found = {("Hybrid" if m.group(2) else "Remote" if m.group(1) else "On-site") for m in _WORK_MODE.finditer(t)}
+        found = {("Hybrid" if m.group(2) else "Remote" if m.group(1) else "On-site") for m in _WORK_MODE.finditer(str(t))}
         if found:
             for mode in ("Hybrid", "Remote", "On-site"):
                 if mode in found:
@@ -525,11 +660,11 @@ _EMP_TYPE = re.compile(
 def detect_employment_type(text: str | None) -> str:
     if not text:
         return ""
-    m = _EMP_TYPE.search(text)
+    m = _EMP_TYPE.search(str(text))
     if not m:
         return ""
     if m.group(1):
-        out = m.group(1).title().replace("Temp", "Temporary") if m.group(1).lower() == "temp" else m.group(1).title()
+        out = "Temporary" if m.group(1).lower() == "temp" else m.group(1).title()
         if m.group(2):
             out += ", " + m.group(2).lower()
         return out
@@ -547,7 +682,7 @@ _SAL_IN_TEXT = re.compile(
 def extract_salary_from_text(text: str | None, default_currency: str = "GBP") -> dict | None:
     if not text:
         return None
-    m = _SAL_IN_TEXT.search(text)
+    m = _SAL_IN_TEXT.search(str(text))
     if not m:
         return None
     sal = parse_salary(m.group(), default_currency)
@@ -582,22 +717,29 @@ PageCallback = Callable[[str, list[dict]], Awaitable[None]]
 
 
 class BaseScraper(ABC):
-    """Base class with HTTP-first fetching and optional lazy browser fallback.
+    """Base class with HTTP-first fetching and lazy browser fallback.
 
-    Subclasses for HTML boards implement `_build_url` and `_parse_search`; the
-    pagination loop lives here. API boards override `search` entirely.
+    HTML boards implement `_build_url` and `_parse_search(html, soup)`; the
+    resumable pagination loop lives here. API boards override `search`.
     """
 
+    # ── Per-board knobs (override in subclasses) ──
     default_currency = "GBP"
     card_selector: str | None = None      # waited on in browser mode
     page_size = 25
-    max_pages = 40                        # per-run cap; main.py lowers it to what the budget needs
-    hard_page_cap: int | None = None      # absolute cap a board sets for itself (unfiltered feeds)
+    max_pages = 40                        # per-run cap; main.py lowers it to the budget
+    hard_page_cap: int | None = None      # absolute cap a board sets for itself
     use_js_fallback = True
+    resumable = True                      # False for boards that override search() without resume state
+    use_stealth_js = True                 # inject STEALTH_JS into the browser context
+    ua_from_browser_version = False       # derive the UA from the real engine version
+    warmup_url: str | None = None         # visited once when the browser context is created
+    blocked_resource_types = BLOCKED_RESOURCE_TYPES
+    browser_max_attempts: int | None = None  # None -> 2 with a proxy to rotate, else 1
 
     def __init__(self, client: httpx.AsyncClient, delay: float = 0.8, *,
                  browser_pool: BrowserPool | None = None, proxy_url: str | None = None,
-                 proxy_config=None, on_page: PageCallback | None = None):
+                 proxy_config=None, on_page: PageCallback | None = None, browser=None):
         self.client = client
         self.delay = delay
         self.browser_pool = browser_pool
@@ -607,12 +749,36 @@ class BaseScraper(ABC):
         self.fetch_mode = "auto"          # auto -> http | browser
         self.stats = {"pages": 0, "http_pages": 0, "browser_pages": 0, "jobs": 0, "mode": "http"}
         self._last_browser_extracted: list[dict] = []
-        # Resumable pagination state: a second `search()` call continues where
-        # the first stopped, which lets main.py run a top-up round.
+        self._last_fetch_salvaged = False
+        self._next_referer: str | None = None
+        self.radius_miles = None
+        self.country_hint = ""
+        self.fetch_details = False
+        # Resumable pagination state: a second `search()` call for the same
+        # keyword continues where the first stopped (top-up round).
         self._page = 1
         self._seen: set[str] = set()
         self.exhausted = False
-        self._keyword = ""                 # remembered so challenge detection can ignore it in titles
+        self._keyword = ""
+        self._location = ""
+
+    @property
+    def browser(self):
+        """True-ish when a browser fallback is available (compat with v0.11 boards)."""
+        return self.browser_pool
+
+    # ── Board-specific soft-block hooks ──────────────────────────────
+
+    def page_is_blocked(self, html: str) -> bool:
+        """Board-specific soft-block detection (bot-detection pages served
+        with HTTP 200 and full-size HTML). Default: never blocked."""
+        return False
+
+    async def on_blocked_page(self, page, html: str) -> str | None:
+        """Salvage hook called with the LIVE Playwright page when
+        page_is_blocked() fired. Return replacement content to use it, or
+        None to fail the attempt (proxy rotates, retry)."""
+        return None
 
     @property
     @abstractmethod
@@ -624,13 +790,20 @@ class BaseScraper(ABC):
                    salary_min: int | None, page: int) -> str:
         raise NotImplementedError
 
-    def _parse_search(self, html: str, soup: BeautifulSoup) -> tuple[list[dict], bool]:
+    def _parse_search(self, html: str, soup) -> tuple[list[dict], bool]:
         raise NotImplementedError
+
+    def _reset_for(self, keyword: str, location: str) -> None:
+        if keyword != self._keyword or location != self._location:
+            self._keyword, self._location = keyword, location
+            self._page = 1
+            self.exhausted = False
+            self._next_referer = None
 
     async def search(self, keyword: str, location: str, max_results: int = 50,
                      job_type: str = "all", salary_min: int | None = None) -> list[dict]:
         all_jobs: list[dict] = []
-        self._keyword = keyword or ""
+        self._reset_for(keyword or "", location or "")
         if self.exhausted:
             return all_jobs
         seen = self._seen
@@ -663,6 +836,7 @@ class BaseScraper(ABC):
                 break
             page += 1
             self._page = page
+            self._next_referer = url
             # Whole pages are emitted (never truncated) so nothing marked as
             # seen is lost on resume; main.py truncates to the global cap.
             all_jobs.extend(fresh)
@@ -713,6 +887,9 @@ class BaseScraper(ABC):
         if is_challenge_page(title, r.status_code, len(text), self._keyword):
             Actor.log.info(f"[{self.source_name}] HTTP {r.status_code} '{title[:40]}' ({len(text)} B) looks blocked")
             return None
+        if self.page_is_blocked(text):
+            Actor.log.info(f"[{self.source_name}] HTTP response is the board's soft-block page")
+            return None
         return text
 
     async def _fetch(self, url: str) -> str | None:
@@ -724,7 +901,7 @@ class BaseScraper(ABC):
             Actor.log.warning(f"[{self.source_name}] Failed to fetch {url}: {type(e).__name__}")
             return None
 
-    async def _fetch_json(self, url: str, headers: dict | None = None) -> dict | list | None:
+    async def _fetch_json(self, url: str, headers: dict | None = None):
         try:
             r = await self.client.get(url, headers=headers)
             r.raise_for_status()
@@ -733,15 +910,29 @@ class BaseScraper(ABC):
             Actor.log.warning(f"[{self.source_name}] Failed to fetch JSON {url[:120]}: {e}")
             return None
 
+    async def _fetch_detail(self, url: str) -> str | None:
+        """Detail page: httpx first (JSON-LD is in the raw HTML), browser only
+        when the page is thin."""
+        html = await self._fetch(url)
+        if html and ("application/ld+json" in html or len(html) > 10000):
+            return html
+        if self.browser_pool:
+            browser_html = await self._fetch_browser(url)
+            if browser_html and len(browser_html) > len(html or ""):
+                return browser_html
+        return html
+
     async def _fetch_browser(self, url: str, max_attempts: int | None = None) -> str | None:
         if not self.browser_pool:
             return None
         if max_attempts is None:
-            # A retry only has a chance if we can rotate to a fresh IP; without
-            # a proxy it just replays the same challenge for another 20 s.
+            max_attempts = self.browser_max_attempts
+        if max_attempts is None:
+            # A retry only has a chance if we can rotate to a fresh IP.
             max_attempts = 2 if self.proxy_config else 1
         for attempt in range(1, max_attempts + 1):
             try:
+                self._last_fetch_salvaged = False
                 html = await self._fetch_browser_once(url)
                 if html:
                     return html
@@ -754,11 +945,20 @@ class BaseScraper(ABC):
         return None
 
     async def _fetch_browser_once(self, url: str) -> str | None:
-        ctx = await self.browser_pool.context(self.source_name, self.proxy_url)
+        ctx = await self.browser_pool.context(self)
         async with self.browser_pool.page_slot:
             page = await ctx.new_page()
             try:
-                resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                goto_kwargs = {"wait_until": "domcontentloaded", "timeout": 30000}
+                if self._next_referer:
+                    goto_kwargs["referer"] = self._next_referer
+                elif self.warmup_url:
+                    goto_kwargs["referer"] = self.warmup_url
+                try:
+                    resp = await page.goto(url, **goto_kwargs)
+                except Exception:
+                    Actor.log.info(f"[{self.source_name}] domcontentloaded timed out, trying load event")
+                    resp = await page.goto(url, wait_until="load", timeout=20000)
                 status = resp.status if resp else None
                 selector = self.card_selector or 'a[href*="/job"]'
                 try:
@@ -768,13 +968,12 @@ class BaseScraper(ABC):
                 title = await page.title()
                 if is_challenge_page(title, status, 10_000, self._keyword):
                     # A Cloudflare JS challenge that is going to pass does so in
-                    # a few seconds; anything longer means this IP is burned, so
-                    # bail out and let the caller rotate the proxy session.
+                    # a few seconds; longer means this IP is burned.
                     Actor.log.info(f"[{self.source_name}] challenge page (status={status}, title='{title[:40]}'), waiting")
                     for _ in range(6):
                         await page.wait_for_timeout(2000)
-                        title = (await page.title()).lower().replace(self._keyword.lower(), "")
-                        if not any(w in title for w in CHALLENGE_TITLE_WORDS):
+                        t = (await page.title()).lower().replace(self._keyword.lower(), "")
+                        if not any(w in t for w in CHALLENGE_TITLE_WORDS):
                             break
                     else:
                         return None
@@ -783,6 +982,14 @@ class BaseScraper(ABC):
                     except Exception:
                         pass
                 html = await page.content()
+                if self.page_is_blocked(html):
+                    Actor.log.info(f"[{self.source_name}] soft-block page after load, trying salvage")
+                    await page.wait_for_timeout(2500 + random.randint(0, 1000))
+                    salvage = await self.on_blocked_page(page, html)
+                    if salvage:
+                        self._last_fetch_salvaged = True
+                        return salvage
+                    return None
                 if len(html) < 3000:
                     return None
                 self._last_browser_extracted = []
@@ -796,13 +1003,15 @@ class BaseScraper(ABC):
                 await page.close()
 
     async def _rotate_proxy(self):
+        """New proxy session for this board; the warmed browser context is
+        discarded with it so a burned session is never reused."""
+        if self.browser_pool:
+            await self.browser_pool.reset_context(self.source_name)
         if not self.proxy_config:
             return
         try:
             safe = re.sub(r"[^a-zA-Z0-9._~]", "_", self.source_name)
             self.proxy_url = await self.proxy_config.new_url(session_id=f"{safe}_{random.randint(10000, 99999)}")
-            if self.browser_pool:
-                await self.browser_pool.reset_context(self.source_name)
             Actor.log.info(f"[{self.source_name}] rotated proxy session")
         except Exception as e:
             Actor.log.warning(f"[{self.source_name}] proxy rotation failed: {e}")
@@ -812,24 +1021,86 @@ class BaseScraper(ABC):
 
     # ── Generic extractors ───────────────────────────────────────────
 
+    def _extract_salary_from_text(self, text: str) -> dict | None:
+        return extract_salary_from_text(text, self.default_currency)
+
+    _LOC_PAT = re.compile(
+        r"\b(?:london|manchester|birmingham|leeds|bristol|liverpool|sheffield|glasgow|edinburgh|cardiff|"
+        r"newcastle|nottingham|southampton|oxford|cambridge|reading|brighton|bath|york|leicester|coventry|"
+        r"city of london|west london|east london|central london|north london|south london|canary wharf|"
+        r"remote|hybrid|on-?site|work from home|wfh|england|scotland|wales|[A-Z]{1,2}\d{1,2}\s*\d[A-Z]{2})\b",
+        re.IGNORECASE)
+    _DATE_PAT = re.compile(
+        r"\b(\d+\s*(?:day|hour|minute|week|month)s?\s*ago|today|yesterday|just\s*(?:now|posted)|"
+        r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2}(?:\s*,?\s*\d{2,4})?)\b",
+        re.IGNORECASE)
+
     def _process_js_extracted(self) -> list[dict]:
+        """Turn raw JS-extracted card data into job dicts using text heuristics."""
         jobs = []
         for raw in self._last_browser_extracted:
             title = clean_text(raw.get("title"))
             if not title:
                 continue
-            card_text = raw.get("_card_text", "")
             job = {"source": self.source_name, "title": title, "url": strip_tracking(raw.get("url", ""))}
-            m = re.search(r"/job/(\d+)|-job(\d+)|/(\d{5,})", job["url"])
-            if m:
-                job["job_id"] = next(g for g in m.groups() if g)
+            if raw.get("job_id"):
+                job["job_id"] = str(raw["job_id"])
+            else:
+                m = re.search(r"/job/(\d+)|-job(\d+)|/(\d{5,})", job["url"])
+                if m:
+                    job["job_id"] = next(g for g in m.groups() if g)
+            company_from_link = clean_text(raw.get("_company_link_text"))
+            if company_from_link:
+                job["company"] = company_from_link
+            card_text = raw.get("_card_text", "") or ""
             apply_salary(job, extract_salary_from_text(card_text, self.default_currency))
-            job["employment_type"] = detect_employment_type(card_text)
-            job["work_mode"] = detect_work_mode(card_text)
+            company_candidates, location_candidates, snippet_candidates = [], [], []
+            for seg in raw.get("_segments", []) or []:
+                seg_clean = re.sub(r"<[^>]+>", "", seg).strip()
+                if len(seg_clean) < 2 or seg_clean == title or seg_clean == company_from_link:
+                    continue
+                if not job.get("date_posted") and len(seg_clean) < 40:
+                    dm = self._DATE_PAT.search(seg_clean)
+                    if dm:
+                        job["date_posted"] = dm.group(1).strip()
+                        continue
+                if not job.get("employment_type") and len(seg_clean) < 40:
+                    et = detect_employment_type(seg_clean)
+                    if et:
+                        job["employment_type"] = et
+                        if len(seg_clean) < 20:
+                            continue
+                if re.search(r"[£$€]\s*\d", seg_clean):
+                    continue
+                if self._LOC_PAT.search(seg_clean) and len(seg_clean) < 80:
+                    if company_from_link and (seg_clean.lower() in company_from_link.lower()
+                                              or company_from_link.lower() in seg_clean.lower()):
+                        continue
+                    location_candidates.append(seg_clean)
+                    continue
+                (company_candidates if len(seg_clean) < 50 else snippet_candidates).append(seg_clean)
+            if not job.get("employment_type"):
+                job["employment_type"] = detect_employment_type(card_text)
+            if not job.get("date_posted"):
+                dm = self._DATE_PAT.search(card_text)
+                if dm:
+                    job["date_posted"] = dm.group(1).strip()
+            if not job.get("company"):
+                for c in company_candidates:
+                    text = re.sub(r"^(?:Company|Posted by|Employer)\s*:?\s*", "", c, flags=re.IGNORECASE).strip()
+                    if 1 < len(text) < 80:
+                        job["company"] = clean_text(text)
+                        break
+            if location_candidates:
+                job["location"] = clean_text(re.sub(r"^Location\s*:?\s*", "", location_candidates[0], flags=re.IGNORECASE))
+            if snippet_candidates:
+                job["snippet"] = clean_text(re.sub(r"<[^>]+>", "", snippet_candidates[0]))[:500]
+            job["work_mode"] = detect_work_mode(job.get("location"), card_text)
             jobs.append(job)
         return jobs
 
-    def _extract_jsonld_jobs(self, soup: BeautifulSoup) -> list[dict]:
+    def _extract_jsonld_jobs(self, html_or_soup) -> list[dict]:
+        soup = _as_soup(html_or_soup)
         jobs = []
         for script in soup.select('script[type="application/ld+json"]'):
             try:
@@ -861,6 +1132,7 @@ class BaseScraper(ABC):
             "date_posted": p.get("datePosted", ""),
             "valid_through": p.get("validThrough", ""),
             "snippet": clean_text(re.sub(r"<[^>]+>", " ", p.get("description", "") or ""))[:500],
+            "full_description": p.get("description", "") or "",
         }
         org = p.get("hiringOrganization", {})
         job["company"] = clean_text(org.get("name", "") if isinstance(org, dict) else str(org))
@@ -882,12 +1154,15 @@ class BaseScraper(ABC):
                 hi = val.get("maxValue") or lo
                 unit = (val.get("unitText") or "YEAR").upper()
                 period = {"YEAR": "annum", "MONTH": "month", "WEEK": "week", "DAY": "day", "HOUR": "hour"}.get(unit, "annum")
+                try:
+                    lo = float(lo or hi or 0)
+                    hi = float(hi or lo or 0)
+                except (TypeError, ValueError):
+                    lo = hi = 0.0
                 if lo or hi:
                     sym = CURRENCY_SYMBOL.get(cur, cur + " ")
-                    lo = float(lo or hi)
-                    hi = float(hi or lo)
                     label = {"annum": "per annum", "month": "per month", "week": "per week", "day": "per day", "hour": "per hour"}[period]
-                    raw = f"{sym}{lo:,.0f} per {label.split()[-1]}" if lo == hi else f"{sym}{lo:,.0f} - {sym}{hi:,.0f} {label}"
+                    raw = f"{sym}{lo:,.0f} {label}" if lo == hi else f"{sym}{lo:,.0f} - {sym}{hi:,.0f} {label}"
                     apply_salary(job, {"raw": raw, "min": lo, "max": hi, "currency": cur, "period": period})
         emp = p.get("employmentType", "")
         if isinstance(emp, list):
@@ -907,7 +1182,8 @@ class BaseScraper(ABC):
         return job
 
     @staticmethod
-    def _extract_next_data(soup: BeautifulSoup) -> dict | None:
+    def _extract_next_data(html_or_soup) -> dict | None:
+        soup = _as_soup(html_or_soup)
         script = soup.select_one("script#__NEXT_DATA__")
         if script and script.string:
             try:

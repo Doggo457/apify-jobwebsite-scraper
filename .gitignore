@@ -1,6 +1,16 @@
 __pycache__/
 *.pyc
 storage/
+apify_storage/
 .venv/
 .env
 *.jpg
+# Local-only material in the working folder (never part of the Actor)
+.platform_0.11/
+Claude outputs/
+# Stale pre-0.4 copies at the repo root (the live code is under src/)
+/main.py
+/utils.py
+/boards/
+/input_schema.json
+/__init__.py

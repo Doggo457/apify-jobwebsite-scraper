@@ -50,6 +50,8 @@ class AdzunaScraper(BaseScraper):
                 params.append(f"{k}={v}")
             if salary_min:
                 params.append(f"salary_min={int(salary_min)}")
+            if self.radius_miles:
+                params.append(f"distance={round(int(self.radius_miles) * 1.60934)}")  # Adzuna wants km
             data = await self._fetch_json(f"{API_BASE.format(country=self.country)}/{page}?" + "&".join(params))
             if not data:
                 break
@@ -75,13 +77,15 @@ class AdzunaScraper(BaseScraper):
     def _parse_result(self, it: dict) -> dict:
         company = it.get("company") or {}
         category = it.get("category") or {}
-        desc = clean_text(it.get("description", ""))
+        item_desc = it.get("description", "") or ""
+        desc = clean_text(item_desc)
         job = {
             "source": self.source_name,
             "title": clean_text(it.get("title", "")),
             "company": clean_text(company.get("display_name", "") if isinstance(company, dict) else str(company)),
             "location": clean_text((it.get("location") or {}).get("display_name", "")),
             "snippet": desc[:500],
+            "full_description": item_desc,
             "employment_type": clean_text(it.get("contract_type", "")).replace("_", "-").title(),
             "date_posted": it.get("created", ""),
             "url": it.get("redirect_url", ""),

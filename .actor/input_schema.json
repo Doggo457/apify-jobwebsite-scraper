@@ -1,5 +1,5 @@
 {
-    "title": "International Jobs Board Scraper Input",
+    "title": "Jobs Board Scraper: Indeed, Reed, Adzuna, RemoteOK & More — Input",
     "type": "object",
     "schemaVersion": 1,
     "properties": {
@@ -72,6 +72,14 @@
             "description": "Type your own search keyword here. Overrides the preset above when filled in.",
             "editor": "textfield",
             "nullable": true
+        },
+        "searchTerms": {
+            "title": "Extra Search Terms (multi-search)",
+            "type": "array",
+            "description": "Search several roles at once. Each term is searched separately and the results are merged and deduplicated into one dataset. Leave empty to just use the keyword above. Example: [\"software engineer\", \"backend developer\", \"platform engineer\"].",
+            "editor": "stringList",
+            "default": [],
+            "prefill": []
         },
         "location": {
             "title": "Location Preset",
@@ -148,64 +156,117 @@
         "country": {
             "title": "Country / Region",
             "type": "string",
-            "description": "Target country for job search. Determines which boards are auto-selected, the proxy region and the default currency.",
+            "description": "Target country for job search. Determines which boards are auto-selected.",
             "editor": "select",
             "default": "uk",
-            "enum": ["uk", "us", "de", "fr", "nl", "au", "remote"],
+            "enum": [
+                "uk",
+                "us",
+                "de",
+                "fr",
+                "nl",
+                "au",
+                "remote"
+            ],
             "enumTitles": [
-                "🇬🇧 United Kingdom (Reed, Totaljobs, CV-Library, CWJobs, Indeed UK, GOV.UK Find a Job, Adzuna)",
-                "🇺🇸 United States (USAJobs, Indeed US, Adzuna, RemoteOK)",
-                "🇩🇪 Germany (Indeed DE, Adzuna, Arbeitnow)",
-                "🇫🇷 France (Indeed FR, Adzuna)",
-                "🇳🇱 Netherlands (Indeed NL, Adzuna)",
-                "🇦🇺 Australia (Indeed AU, Adzuna)",
-                "🌍 Remote / Global (RemoteOK, Arbeitnow, Adzuna)"
+                "🇬🇧 United Kingdom (Reed, Totaljobs, CV-Library, CWJobs, Indeed UK, FindAJob, Adzuna, The Muse)",
+                "🇺🇸 United States (USAJobs, Indeed US, Adzuna, RemoteOK, The Muse, Remotive)",
+                "🇩🇪 Germany (Indeed DE, Adzuna, Arbeitnow, The Muse)",
+                "🇫🇷 France (Indeed FR, Adzuna, The Muse)",
+                "🇳🇱 Netherlands (Indeed NL, Adzuna, The Muse)",
+                "🇦🇺 Australia (Indeed AU, Adzuna, The Muse)",
+                "🌍 Remote / Global (RemoteOK, Arbeitnow, Remotive, Jobicy, The Muse, Adzuna)"
             ]
         },
         "max_results": {
             "title": "Max Results",
             "type": "integer",
-            "description": "Maximum total job listings to return (spread across all boards). Minimum 100. If some boards come up short the others are asked for more so you get the number you asked for.",
-            "default": 100,
+            "description": "Maximum total job listings to return (spread across all boards). Minimum 100.",
+            "default": 1000,
             "minimum": 100
         },
         "unlimited": {
             "title": "Unlimited Mode",
             "type": "boolean",
-            "description": "Scrape without a results cap. Results are saved page by page as they come in, so you keep everything even if you stop the run early. Overrides Max Results. Bounded by 'Max pages per board' below.",
+            "description": "Scrape without a results cap. Results are saved as they come in, so you keep everything even if you stop the run early. Overrides Max Results.",
             "default": false
         },
         "salary_min": {
             "title": "Minimum Salary",
             "type": "integer",
-            "description": "Minimum annual salary filter in the country's currency (e.g. 30000, 50000, 75000). Applied on the boards that support it and again on the parsed salaries. Leave empty for no filter.",
+            "description": "Minimum annual salary filter (e.g. 30000, 50000, 75000). Leave empty for no filter.",
             "editor": "number",
             "nullable": true,
             "sectionCaption": "Filters",
             "sectionDescription": "Narrow down your job search results"
         },
         "job_type": {
-            "title": "Job Type",
+            "title": "Contract Type (per-board filter)",
             "type": "string",
-            "description": "Filter by employment type",
+            "description": "Employment filter sent straight to the boards that support it (Reed, Indeed, Adzuna, GOV.UK Find a Job). Leave on 'All Types' to let the Job Type filter below handle it across every board.",
             "editor": "select",
             "default": "all",
-            "enum": ["all", "permanent", "temporary", "contract", "part-time"],
-            "enumTitles": ["All Types", "Permanent", "Temporary", "Contract", "Part-time"]
+            "enum": [
+                "all",
+                "permanent",
+                "temporary",
+                "contract",
+                "part-time"
+            ],
+            "enumTitles": [
+                "All Types",
+                "Permanent",
+                "Temporary",
+                "Contract",
+                "Part-time"
+            ]
         },
-        "posted_within_days": {
-            "title": "Posted Within (days)",
+        "jobType": {
+            "title": "Job Type",
+            "type": "string",
+            "description": "Normalized job-type filter applied across every board. Boards that expose a type are filtered on it; where they don't, the type is inferred from the title/description. Jobs whose type can't be determined are kept.",
+            "editor": "select",
+            "default": "any",
+            "prefill": "any",
+            "enum": [
+                "any",
+                "fulltime",
+                "parttime",
+                "contract",
+                "internship"
+            ],
+            "enumTitles": [
+                "Any",
+                "Full-time",
+                "Part-time",
+                "Contract / Freelance",
+                "Internship"
+            ]
+        },
+        "remoteOnly": {
+            "title": "Remote Only",
+            "type": "boolean",
+            "description": "Keep only remote roles. Detected from the location, title and source board (remote-first boards are always remote).",
+            "default": false
+        },
+        "postedWithinHours": {
+            "title": "Posted Within (hours)",
             "type": "integer",
-            "description": "Only keep listings posted in the last N days (e.g. 7). Listings with no readable date are kept. Leave empty for no filter.",
+            "description": "Only keep jobs posted within this many hours (e.g. 24 = last day, 168 = last week). Jobs with no readable post date are kept. Leave empty for no date filter.",
             "editor": "number",
-            "nullable": true,
-            "minimum": 1,
-            "maximum": 365
+            "nullable": true
+        },
+        "radiusMiles": {
+            "title": "Search Radius (miles)",
+            "type": "integer",
+            "description": "Widen the search around your location by this many miles. Passed to boards that support a radius (Indeed, Adzuna); ignored by boards that don't. Leave empty for each board's default.",
+            "editor": "number",
+            "nullable": true
         },
         "boards": {
             "title": "Job Boards to Scrape",
             "type": "array",
-            "description": "Pick specific boards or leave empty to auto-select based on your chosen country. Indeed and CV-Library sit behind aggressive bot protection and are best-effort.",
+            "description": "Pick specific boards or leave empty to auto-select based on your chosen country. Cost tip: the free-API boards (RemoteOK, Arbeitnow, The Muse, Remotive, Jobicy, Adzuna, USAJobs) need no browser or proxy — a run using only these is the cheapest and can be run at 1024 MB memory.",
             "default": [],
             "editor": "select",
             "items": {
@@ -225,24 +286,30 @@
                     "indeed_nl",
                     "indeed_au",
                     "remoteok",
-                    "arbeitnow"
+                    "arbeitnow",
+                    "themuse",
+                    "remotive",
+                    "jobicy"
                 ],
                 "enumTitles": [
                     "Reed (UK)",
                     "Totaljobs (UK)",
-                    "CV-Library (UK, best-effort)",
+                    "CV-Library (UK, best-effort: bot protection)",
                     "CWJobs (UK)",
-                    "Indeed UK (best-effort)",
-                    "GOV.UK Find a Job / Work Hub",
-                    "Adzuna (Multi-Country, needs free API key)",
-                    "USAJobs (US Gov, needs free API key)",
-                    "Indeed US (best-effort)",
-                    "Indeed Germany (best-effort)",
-                    "Indeed France (best-effort)",
-                    "Indeed Netherlands (best-effort)",
-                    "Indeed Australia (best-effort)",
+                    "Indeed UK (best-effort: bot protection)",
+                    "GOV.UK Find a Job (Work Hub)",
+                    "Adzuna (Multi-Country)",
+                    "USAJobs (US Gov)",
+                    "Indeed US (best-effort: bot protection)",
+                    "Indeed Germany (best-effort: bot protection)",
+                    "Indeed France (best-effort: bot protection)",
+                    "Indeed Netherlands (best-effort: bot protection)",
+                    "Indeed Australia (best-effort: bot protection)",
                     "RemoteOK (Global Remote)",
-                    "Arbeitnow (EU & Remote)"
+                    "Arbeitnow (EU & Remote)",
+                    "The Muse (Global, free API)",
+                    "Remotive (Global Remote, free API)",
+                    "Jobicy (Global Remote, free API)"
                 ]
             },
             "sectionCaption": "Board Selection",
@@ -253,7 +320,7 @@
             "sectionDescription": "Control output and cost",
             "title": "Remove Duplicates",
             "type": "boolean",
-            "description": "Remove the same job appearing on multiple boards (matched on title + company + town)",
+            "description": "Merge duplicate jobs that appear on multiple boards into one record citing every source. Identical listings (same board, same URL) found by more than one search term are always returned only once, even with this off.",
             "default": true
         },
         "salary_benchmark": {
@@ -262,22 +329,54 @@
             "description": "Output salary summary statistics (median, mean, p25, p75) alongside job listings",
             "default": false
         },
+        "descriptionFormat": {
+            "title": "Description Format",
+            "type": "string",
+            "description": "Format of the job `description` field: Markdown (default), raw HTML, or plain text.",
+            "editor": "select",
+            "default": "markdown",
+            "prefill": "markdown",
+            "enum": [
+                "markdown",
+                "html",
+                "plaintext"
+            ],
+            "enumTitles": [
+                "Markdown",
+                "HTML",
+                "Plain text"
+            ]
+        },
+        "resolveApplyUrl": {
+            "title": "Resolve Real Apply URL (slower)",
+            "type": "boolean",
+            "description": "Follow redirects on aggregator links to reveal the real company/ATS apply URL (Greenhouse, Lever, Workday, Ashby…) and detect the ATS more often. Off by default because it adds a network request per job — leave off for the cheapest runs.",
+            "default": false
+        },
+        "incrementalOnly": {
+            "title": "Incremental Mode (new jobs only)",
+            "type": "boolean",
+            "description": "For scheduled/recurring runs: remember jobs seen in previous runs of the same search and push ONLY jobs that are new since last time. The first run returns everything and starts the memory. Great for daily/weekly job alerts.",
+            "default": false
+        },
         "reed_api_key": {
             "title": "Reed API Key",
             "type": "string",
-            "description": "Optional: free key from https://www.reed.co.uk/developers. When set, Reed is read through its official JSON API (100 results per request, includes descriptions) instead of its web pages.",
+            "description": "Optional: free key from https://www.reed.co.uk/developers. When set, Reed is read through its official JSON API (100 results per request, includes descriptions, never blocked, no proxy) instead of its web pages.",
             "editor": "textfield",
             "nullable": true,
             "isSecret": true,
-            "sectionCaption": "API Keys (Optional)",
-            "sectionDescription": "Free API keys unlock extra boards and make Reed cheaper and more complete"
+            "sectionCaption": "Reed API (Optional)",
+            "sectionDescription": "A free Reed API key makes the biggest UK board cheaper and more complete"
         },
         "adzuna_app_id": {
             "title": "Adzuna App ID",
             "type": "string",
             "description": "Optional: Adzuna API App ID (free at https://developer.adzuna.com)",
             "editor": "textfield",
-            "nullable": true
+            "nullable": true,
+            "sectionCaption": "Adzuna API (Optional)",
+            "sectionDescription": "Register for free API keys at https://developer.adzuna.com to enable Adzuna scraping"
         },
         "adzuna_app_key": {
             "title": "Adzuna App Key",
@@ -290,22 +389,24 @@
         "usajobs_api_key": {
             "title": "USAJobs API Key",
             "type": "string",
-            "description": "Required for the USAJobs board. Free at https://developer.usajobs.gov/apirequest/",
+            "description": "Optional: USAJobs API key (free at https://developer.usajobs.gov). Required for the USAJobs board — without it the board is skipped.",
             "editor": "textfield",
             "nullable": true,
-            "isSecret": true
+            "isSecret": true,
+            "sectionCaption": "USAJobs API (Optional)",
+            "sectionDescription": "Register for a free API key at https://developer.usajobs.gov to enable the USAJobs board"
         },
-        "usajobs_user_email": {
-            "title": "USAJobs Registered Email",
+        "usajobs_email": {
+            "title": "USAJobs Email",
             "type": "string",
-            "description": "The email address you registered the USAJobs API key with (sent as the User-Agent, as their API requires)",
+            "description": "Optional: the email address your USAJobs API key was issued to (sent as the User-Agent header on USAJobs API requests).",
             "editor": "textfield",
             "nullable": true
         },
         "max_pages_per_board": {
             "title": "Max pages per board",
             "type": "integer",
-            "description": "Hard cap on search pages fetched per board (25-50 listings per page). Mainly bounds Unlimited Mode.",
+            "description": "Hard cap on search pages fetched per board and search term (25-50 listings per page). Mainly bounds Unlimited Mode.",
             "default": 40,
             "minimum": 1,
             "maximum": 400,
@@ -315,12 +416,23 @@
         "proxy_mode": {
             "title": "Proxy",
             "type": "string",
-            "description": "Residential proxies (default) are the most reliable for the UK job boards. Datacenter is cheaper but more often blocked. 'None' disables proxies entirely.",
+            "description": "Residential proxies (default) are the most reliable for the UK job boards and GOV.UK. Datacenter is cheaper but more often blocked. 'None' disables proxies entirely. API boards never use a proxy.",
             "editor": "select",
             "default": "residential",
-            "enum": ["residential", "datacenter", "none"],
-            "enumTitles": ["Residential (recommended)", "Datacenter (cheaper, may be blocked)", "None"]
+            "enum": [
+                "residential",
+                "datacenter",
+                "none"
+            ],
+            "enumTitles": [
+                "Residential (recommended)",
+                "Datacenter (cheaper, may be blocked)",
+                "None"
+            ]
         }
     },
-    "required": ["keyword", "location"]
+    "required": [
+        "keyword",
+        "location"
+    ]
 }

@@ -1,16 +1,18 @@
 {
     "actorSpecification": 1,
     "name": "uk-jobs-board-scraper",
-    "title": "International Jobs Board Scraper",
-    "description": "Search 14+ job boards across UK, US, EU & remote in one run: Reed, Totaljobs, CV-Library, CWJobs, Indeed (UK/US/DE/FR/NL/AU), GOV.UK, USAJobs, Adzuna, RemoteOK & Arbeitnow. Deduplicated results with parsed salaries, ISO dates, work mode and optional salary benchmarks.",
-    "version": "0.4",
+    "title": "Jobs Board Scraper: Indeed, Reed, Adzuna, RemoteOK & More",
+    "description": "Scrape job listings from Indeed, Reed, Totaljobs, CV-Library, Adzuna, RemoteOK, Arbeitnow and more across the UK, US and Europe. Export title, company, location, salary, description and apply URL. Filter by keyword and location. CSV, JSON, Excel.",
+    "version": "0.12",
+    "buildTag": "experimental",
+    "minMemoryMbytes": 1024,
+    "maxMemoryMbytes": 4096,
+    "defaultMemoryMbytes": 2048,
     "meta": {
         "templateId": "python-empty"
     },
     "input": "input_schema.json",
     "output": "output_schema.json",
     "dataset": "dataset_schema.json",
-    "dockerfile": "./Dockerfile",
-    "defaultMemoryMbytes": 2048,
-    "minMemoryMbytes": 1024
+    "dockerfile": "./Dockerfile"
 }
