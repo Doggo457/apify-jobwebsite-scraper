@@ -46,6 +46,7 @@ class StepStoneScraper(BaseScraper):
         self._page_count: int | None = None
         self._variant = 0       # sweep position: index into _variants()
         self._vpage = 1         # page within the current variant
+        self._http_misses = 0   # consecutive searches refused over HTTP
 
     # ── URL building ─────────────────────────────────────────────────
 
@@ -95,7 +96,16 @@ class StepStoneScraper(BaseScraper):
                 break
             segment, sort = variants[self._variant]
             url = self._search_url(keyword, location, segment, sort, salary_min, self._vpage)
-            html = await self._get_html(url)
+            # One refused search (the edge answers some path/sort combinations
+            # with an empty 400) is skipped over HTTP rather than flipping the
+            # whole board to the browser; two in a row escalate the normal way.
+            if self.fetch_mode == "http" and self._http_misses < 2:
+                html = await self._fetch_html_http(url)
+                self._http_misses = 0 if html else self._http_misses + 1
+                if html:
+                    self.stats["http_pages"] += 1
+            else:
+                html = await self._get_html(url)
             jobs, has_next = self._parse_search(html, LazySoup(html)) if html else ([], False)
             pages_left -= 1
             fresh = []
@@ -116,7 +126,7 @@ class StepStoneScraper(BaseScraper):
                 if self.on_page:
                     await self.on_page(self.source_name, fresh)
             else:
-                Actor.log.info(f"[{self.source_name}] {label} p{self._vpage}: nothing new, next search")
+                Actor.log.info(f"[{self.source_name}] {label} p{self._vpage}: {'refused' if html is None else 'nothing new'}, next search")
             # Advance: next page of this search while it has one and we are
             # under the depth cap; otherwise the next search variant.
             if fresh and has_next and self._vpage < self.sweep_depth:
