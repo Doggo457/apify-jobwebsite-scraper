@@ -333,7 +333,7 @@ async def main() -> None:
         keyword = _pick(actor_input, "keyword", "custom_keyword", "software engineer")
         location = _pick(actor_input, "location", "custom_location", "London")
         unlimited = bool(actor_input.get("unlimited", False))
-        max_results = 0 if unlimited else max(int(actor_input.get("max_results") or 100), 100)
+        max_results = 0 if unlimited else max(int(actor_input.get("max_results") or 1000), 100)
         salary_min = int(actor_input["salary_min"]) if actor_input.get("salary_min") else None
         job_type = (actor_input.get("job_type") or "all").lower()
         country = (actor_input.get("country") or "uk").lower()
