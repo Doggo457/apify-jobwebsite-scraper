@@ -1,0 +1,13 @@
+{
+    "actorOutputSchemaVersion": 1,
+    "title": "UK Jobs Board Scraper Output",
+    "description": "Job listings scraped from up to 7 UK job boards, deduplicated and structured.",
+    "properties": {
+        "jobListings": {
+            "title": "Job Listings",
+            "description": "Structured job data from all selected boards",
+            "type": "string",
+            "template": "{{links.apiDefaultDatasetUrl}}/items"
+        }
+    }
+}

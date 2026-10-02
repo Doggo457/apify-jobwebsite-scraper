@@ -1,68 +1,64 @@
 """
-International Jobs Board Scraper - Multi-Board Aggregator
-Scrapes job listings from UK, US, EU and remote job boards with unified output.
+International Jobs Board Scraper - multi-board aggregator (Apify Actor).
 
-Supported boards:
+Boards:
   UK:     Reed, Totaljobs, CV-Library, CWJobs, Indeed UK, GOV.UK Find a Job
   US:     USAJobs, Indeed US
   EU:     Indeed DE/FR/NL, Arbeitnow
-  Global: Adzuna (multi-country API), RemoteOK
+  Global: Adzuna (multi-country API), RemoteOK, Indeed AU
+
+Cost model on Apify is memory x wall-clock (+ proxy GB), so this entry point:
+  * runs every board concurrently instead of browser boards one after another,
+  * fetches over HTTP and only launches Chromium if a board is actually blocked,
+  * gives API boards a direct (unproxied) client - residential bandwidth is the
+    most expensive thing in the bill and public APIs don't need it,
+  * pushes results in batches per page instead of one API call per row.
 """
 
+from __future__ import annotations
+
 import asyncio
-import os
+import math
 import random
 import re
 import statistics
+import time
+from collections import defaultdict
 
 import httpx
 from apify import Actor
-from playwright.async_api import async_playwright
 
-from .utils import make_headers
-from .boards.reed import ReedScraper
-from .boards.totaljobs import TotaljobsScraper
+from .boards.adzuna import AdzunaScraper
+from .boards.arbeitnow import ArbeitnowScraper
 from .boards.cvlibrary import CVLibraryScraper
 from .boards.cwjobs import CWJobsScraper
-from .boards.indeed import IndeedUKScraper, IndeedScraper
 from .boards.findajob import FindAJobScraper
-from .boards.adzuna import AdzunaScraper
-from .boards.usajobs import USAJobsScraper
+from .boards.indeed import IndeedScraper, IndeedUKScraper
+from .boards.reed import ReedScraper
 from .boards.remoteok import RemoteOKScraper
-from .boards.arbeitnow import ArbeitnowScraper
+from .boards.totaljobs import TotaljobsScraper
+from .boards.usajobs import USAJobsScraper
+from .utils import BrowserPool, annualise, make_api_headers, make_headers, normalize_date
 
-
-# Map board names to scraper classes
-BOARD_REGISTRY = {
-    # UK boards
-    "reed": ReedScraper,
-    "totaljobs": TotaljobsScraper,
-    "cvlibrary": CVLibraryScraper,
-    "cwjobs": CWJobsScraper,
-    "indeed": IndeedUKScraper,
-    "findajob": FindAJobScraper,
-    # US boards
-    "usajobs": USAJobsScraper,
-    "indeed_us": lambda client, **kw: IndeedScraper(client, base_url="https://www.indeed.com", source="indeed.com", **kw),
-    # EU boards
-    "indeed_de": lambda client, **kw: IndeedScraper(client, base_url="https://de.indeed.com", source="indeed.de", **kw),
-    "indeed_fr": lambda client, **kw: IndeedScraper(client, base_url="https://fr.indeed.com", source="indeed.fr", **kw),
-    "indeed_nl": lambda client, **kw: IndeedScraper(client, base_url="https://nl.indeed.com", source="indeed.nl", **kw),
-    "indeed_au": lambda client, **kw: IndeedScraper(client, base_url="https://au.indeed.com", source="indeed.au", **kw),
-    # Remote / global
-    "remoteok": RemoteOKScraper,
-    "arbeitnow": ArbeitnowScraper,
-    # Adzuna handled separately (needs API keys + country config)
+# board -> (factory, kind). kind: "html" = proxied HTTP + browser fallback, "api" = direct, no browser.
+BOARD_REGISTRY: dict[str, tuple] = {
+    "reed":      (ReedScraper, "html"),
+    "totaljobs": (TotaljobsScraper, "html"),
+    "cvlibrary": (CVLibraryScraper, "html"),
+    "cwjobs":    (CWJobsScraper, "html"),
+    "indeed":    (IndeedUKScraper, "html"),
+    "indeed_us": (lambda c, **kw: IndeedScraper(c, base_url="https://www.indeed.com", source="indeed.com", currency="USD", **kw), "html"),
+    "indeed_de": (lambda c, **kw: IndeedScraper(c, base_url="https://de.indeed.com", source="indeed.de", currency="EUR", **kw), "html"),
+    "indeed_fr": (lambda c, **kw: IndeedScraper(c, base_url="https://fr.indeed.com", source="indeed.fr", currency="EUR", **kw), "html"),
+    "indeed_nl": (lambda c, **kw: IndeedScraper(c, base_url="https://nl.indeed.com", source="indeed.nl", currency="EUR", **kw), "html"),
+    "indeed_au": (lambda c, **kw: IndeedScraper(c, base_url="https://au.indeed.com", source="indeed.au", currency="AUD", **kw), "html"),
+    "findajob":  (FindAJobScraper, "api"),      # gov.uk blocks proxies; plain HTML over a direct connection
+    "usajobs":   (USAJobsScraper, "api"),
+    "remoteok":  (RemoteOKScraper, "api"),
+    "arbeitnow": (ArbeitnowScraper, "api"),
+    "adzuna":    (AdzunaScraper, "api"),
 }
 
-# Boards that REQUIRE Playwright browser rendering (JS-heavy, anti-bot)
-BROWSER_BOARDS = {"totaljobs", "cwjobs", "cvlibrary", "indeed", "reed",
-                  "indeed_us", "indeed_de", "indeed_fr", "indeed_nl", "indeed_au"}
-
-# HTTP-only boards (no browser needed, or gov.uk blocks proxies)
-HTTP_ONLY_BOARDS = {"findajob", "usajobs", "remoteok", "arbeitnow", "adzuna"}
-
-# Default boards per country
 COUNTRY_DEFAULTS = {
     "uk": ["reed", "totaljobs", "cvlibrary", "cwjobs", "indeed", "findajob", "adzuna"],
     "us": ["usajobs", "indeed_us", "adzuna", "remoteok"],
@@ -72,623 +68,448 @@ COUNTRY_DEFAULTS = {
     "au": ["indeed_au", "adzuna"],
     "remote": ["remoteok", "arbeitnow", "adzuna"],
 }
+ADZUNA_COUNTRY = {"uk": "gb", "us": "us", "de": "de", "fr": "fr", "nl": "nl", "au": "au", "remote": "gb"}
+COUNTRY_CURRENCY = {"uk": "GBP", "us": "USD", "de": "EUR", "fr": "EUR", "nl": "EUR", "au": "AUD", "remote": "USD"}
+ACCEPT_LANGUAGE = {"de": "de-DE,de;q=0.9,en;q=0.7", "fr": "fr-FR,fr;q=0.9,en;q=0.7", "nl": "nl-NL,nl;q=0.9,en;q=0.7",
+                   "us": "en-US,en;q=0.9", "au": "en-AU,en;q=0.9"}
 
-# Adzuna country code mapping
-ADZUNA_COUNTRY_MAP = {
-    "uk": "gb", "us": "us", "de": "de", "fr": "fr",
-    "nl": "nl", "au": "au", "remote": "gb",
-}
+PUSH_BATCH = 200
+OUTPUT_FIELDS = ("title", "company", "location", "salary_raw", "salary_min", "salary_max", "salary_currency",
+                 "salary_period", "employment_type", "work_mode", "snippet", "date_posted", "valid_through",
+                 "url", "job_id", "source", "category")
 
-# Playwright browser launch args for stealth
-STEALTH_ARGS = [
-    "--no-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-blink-features=AutomationControlled",
-    "--disable-features=IsolateOrigins,site-per-process",
-    "--disable-infobars",
-    "--disable-background-networking",
-    "--disable-default-apps",
-    "--disable-extensions",
-    "--disable-sync",
-    "--disable-translate",
-    "--no-first-run",
-    "--ignore-certificate-errors",
-    "--window-size=1920,1080",
+
+# ──────────────────────────────────────────────────────────────────────
+# Categorisation (title keyword matching, first match wins)
+# ──────────────────────────────────────────────────────────────────────
+
+_CATEGORIES: list[tuple[str, tuple[str, ...]]] = [
+    ("Software Development", ("software eng", "software dev", "full stack", "fullstack", "full-stack", "frontend", "front-end",
+                              "front end", "backend", "back-end", "back end", "web dev", "mobile dev", "ios dev", "android dev",
+                              "flutter", "react", "angular", "vue.js", "node.js", "python dev", "java dev", ".net dev", "c# dev",
+                              "c++ dev", "rust dev", "golang", "ruby dev", "php dev", "programmer", "coder", "software architect",
+                              "principal engineer", "lead developer", "lead engineer", "tech lead")),
+    ("Data & Analytics", ("data scien", "data analy", "data eng", "machine learn", "ml eng", "ai eng", "artificial intelligence",
+                          "deep learn", "nlp", "computer vision", "business intellig", "bi analyst", "bi developer", "analytics eng",
+                          "data architect")),
+    ("DevOps & Infrastructure", ("devops", "sre", "site reliab", "platform eng", "cloud eng", "cloud arch", "infrastructure",
+                                 "kubernetes", "docker", "terraform", "aws eng", "azure eng", "gcp eng", "systems eng", "linux eng",
+                                 "network eng", "devsecops")),
+    ("Cybersecurity", ("cyber", "security eng", "security analy", "penetration", "pen test", "infosec", "information security",
+                       "soc analyst", "security architect", "security consult")),
+    ("QA & Testing", ("qa ", "qa eng", "test eng", "tester", "sdet", "automation eng", "quality assurance", "test analy",
+                      "test lead", "test manager")),
+    ("Product Management", ("product manager", "product owner", "product lead", "head of product", "vp product", "cpo",
+                            "product director")),
+    ("Project & Delivery Management", ("project manager", "programme manager", "program manager", "delivery manager",
+                                       "scrum master", "agile coach", "release manager", "pmo", "project coordinator",
+                                       "delivery lead")),
+    ("Design & UX", ("ux ", "ui ", "ux/ui", "ui/ux", "user experience", "user interface", "product design", "interaction design",
+                     "visual design", "graphic design", "web design", "design lead", "creative director")),
+    ("IT Management & Support", ("it manager", "it director", "cto", "cio", "head of engineering", "head of it", "vp engineering",
+                                 "engineering manager", "development manager", "it service", "service desk", "helpdesk",
+                                 "help desk", "it support", "desktop support", "it admin", "systems admin", "it operations")),
+    ("Database & BI", ("dba", "database admin", "database eng", "database dev", "sql dev", "etl dev", "data warehouse",
+                       "database architect")),
+    ("IT Consulting & Architecture", ("solution architect", "enterprise architect", "technical architect", "integration architect",
+                                      "it consult", "technology consult", "technical consult", "sap consult", "salesforce",
+                                      "dynamics 365", "erp consult", "crm consult", "business analyst")),
+    ("Finance & Accounting", ("accountant", "accounting", "finance manager", "financial analy", "financial controller",
+                              "bookkeeper", "payroll", "tax ", "audit", "treasury", "credit analy", "fund manager",
+                              "investment analy", "actuary", "cfo")),
+    ("Marketing & Communications", ("marketing", "seo ", "ppc ", "content writer", "copywriter", "social media", "digital market",
+                                    "brand manager", "communications", "pr manager", "public relations", "cmo")),
+    ("Sales & Business Development", ("sales manager", "sales exec", "sales rep", "account manager", "account exec",
+                                      "business develop", "bdr ", "sdr ", "commercial manager", "sales director")),
+    ("HR & Recruitment", ("hr ", "human resource", "recruiter", "recruitment", "talent acqui", "people manager", "people partner",
+                          "learning and dev", "l&d ", "training manager", "compensation", "reward", "hrbp")),
+    ("Healthcare & Medical", ("nurse", "doctor", "clinical", "pharmacist", "physiotherapist", "occupational therap", "healthcare",
+                              "medical", "gp ", "surgeon", "dental", "radiographer", "midwife", "care assistant", "support worker")),
+    ("Education & Training", ("teacher", "lecturer", "professor", "tutor", "teaching assistant", "education", "headteacher",
+                              "head of department", "send ", "pastoral")),
+    ("Engineering", ("mechanical eng", "electrical eng", "civil eng", "structural eng", "chemical eng", "process eng",
+                     "manufacturing eng", "maintenance eng", "building services", "quantity surveyor", "site manager",
+                     "construction manager")),
+    ("Legal & Compliance", ("solicitor", "barrister", "paralegal", "legal counsel", "legal advisor", "lawyer", "conveyancer",
+                            "compliance officer", "regulatory")),
+    ("Operations & Logistics", ("supply chain", "logistics", "procurement", "warehouse", "buyer", "purchasing",
+                                "operations manager", "operations director", "facilities", "fleet manager")),
+    ("Customer Service", ("customer service", "customer support", "call centre", "call center", "contact centre",
+                          "client service", "customer success")),
+    ("Administration", ("admin", "office manager", "receptionist", "personal assistant", "executive assistant", "secretary",
+                        "office coordinator")),
 ]
 
 
-async def run_board(scraper, keyword, location, max_per_board, job_type, salary_min) -> list[dict]:
-    """Run a single board scraper with error handling."""
-    try:
-        return await scraper.search(
-            keyword=keyword,
-            location=location,
-            max_results=max_per_board,
-            job_type=job_type,
-            salary_min=salary_min,
-        )
-    except Exception as e:
-        Actor.log.error(f"[{scraper.source_name}] Scraper failed: {e}")
-        return []
+def _compile_category(keys: tuple[str, ...]) -> re.Pattern:
+    # Every key must start at a word boundary ("postdoctoral" is not a doctor,
+    # "director" is not a CTO). Short keys must also end at one, so "cto"
+    # cannot match inside "contractor"; longer keys stay prefix matches so
+    # "software eng" still covers "software engineering".
+    parts = []
+    for k in keys:
+        core = k.strip()
+        esc = re.escape(k)
+        lead = r"\b" if core[:1].isalnum() else ""
+        trail = r"\b" if len(core) <= 4 and core.isalpha() else ""
+        parts.append(f"{lead}{esc.strip() if trail else esc}{trail}")
+    return re.compile("|".join(parts))
+
+
+_CATEGORY_PATTERNS = [(name, _compile_category(keys)) for name, keys in _CATEGORIES]
 
 
 def categorize_job(title: str) -> str:
-    """Infer a job category from the title using keyword matching.
-
-    Returns one of a fixed set of categories, or "Other" if no match.
-    Checked in order — first match wins, so more specific patterns come first.
-    """
     if not title:
         return "Other"
     t = title.lower()
-
-    # ── Software / IT ──
-    if any(k in t for k in ("software eng", "software dev", "full stack", "fullstack",
-                            "full-stack", "frontend", "front-end", "front end",
-                            "backend", "back-end", "back end", "web dev",
-                            "mobile dev", "ios dev", "android dev", "flutter",
-                            "react", "angular", "vue.js", "node.js", "python dev",
-                            "java dev", ".net dev", "c# dev", "c++ dev", "rust dev",
-                            "golang", "ruby dev", "php dev", "programmer", "coder",
-                            "software architect", "principal engineer",
-                            "lead developer", "lead engineer", "tech lead")):
-        return "Software Development"
-
-    if any(k in t for k in ("data scien", "data analy", "data eng", "machine learn",
-                            "ml eng", "ai eng", "artificial intelligence",
-                            "deep learn", "nlp", "computer vision",
-                            "business intellig", "bi analyst", "bi developer",
-                            "analytics eng", "data architect")):
-        return "Data & Analytics"
-
-    if any(k in t for k in ("devops", "sre", "site reliab", "platform eng",
-                            "cloud eng", "cloud arch", "infrastructure",
-                            "kubernetes", "docker", "terraform", "aws eng",
-                            "azure eng", "gcp eng", "systems eng", "linux eng",
-                            "network eng", "devsecops")):
-        return "DevOps & Infrastructure"
-
-    if any(k in t for k in ("cyber", "security eng", "security analy",
-                            "penetration", "pen test", "infosec",
-                            "information security", "soc analyst",
-                            "security architect", "security consult")):
-        return "Cybersecurity"
-
-    if any(k in t for k in ("qa ", "qa eng", "test eng", "tester", "sdet",
-                            "automation eng", "quality assurance", "test analy",
-                            "test lead", "test manager")):
-        return "QA & Testing"
-
-    if any(k in t for k in ("product manager", "product owner", "product lead",
-                            "head of product", "vp product", "cpo",
-                            "product director")):
-        return "Product Management"
-
-    if any(k in t for k in ("project manager", "programme manager",
-                            "program manager", "delivery manager",
-                            "scrum master", "agile coach", "release manager",
-                            "pmo", "project coordinator", "delivery lead")):
-        return "Project & Delivery Management"
-
-    if any(k in t for k in ("ux ", "ui ", "ux/ui", "ui/ux", "user experience",
-                            "user interface", "product design", "interaction design",
-                            "visual design", "graphic design", "web design",
-                            "design lead", "creative director")):
-        return "Design & UX"
-
-    if any(k in t for k in ("it manager", "it director", "cto", "cio",
-                            "head of engineering", "head of it",
-                            "vp engineering", "engineering manager",
-                            "development manager", "it service",
-                            "service desk", "helpdesk", "help desk",
-                            "it support", "desktop support", "it admin",
-                            "systems admin", "it operations")):
-        return "IT Management & Support"
-
-    if any(k in t for k in ("dba", "database admin", "database eng",
-                            "database dev", "sql dev", "etl dev",
-                            "data warehouse", "database architect")):
-        return "Database & BI"
-
-    if any(k in t for k in ("solution architect", "enterprise architect",
-                            "technical architect", "integration architect",
-                            "it consult", "technology consult",
-                            "technical consult", "sap consult",
-                            "salesforce", "dynamics 365", "erp consult",
-                            "crm consult", "business analyst")):
-        return "IT Consulting & Architecture"
-
-    # ── Non-IT categories ──
-    if any(k in t for k in ("accountant", "accounting", "finance manager",
-                            "financial analy", "financial controller",
-                            "bookkeeper", "payroll", "tax ", "audit",
-                            "treasury", "credit analy", "fund manager",
-                            "investment analy", "actuary", "cfo")):
-        return "Finance & Accounting"
-
-    if any(k in t for k in ("marketing", "seo ", "ppc ", "content writer",
-                            "copywriter", "social media", "digital market",
-                            "brand manager", "communications", "pr manager",
-                            "public relations", "cmo")):
-        return "Marketing & Communications"
-
-    if any(k in t for k in ("sales manager", "sales exec", "sales rep",
-                            "account manager", "account exec",
-                            "business develop", "bdr ", "sdr ",
-                            "commercial manager", "sales director")):
-        return "Sales & Business Development"
-
-    if any(k in t for k in ("hr ", "human resource", "recruiter", "recruitment",
-                            "talent acqui", "people manager", "people partner",
-                            "learning and dev", "l&d ", "training manager",
-                            "compensation", "reward", "hrbp")):
-        return "HR & Recruitment"
-
-    if any(k in t for k in ("nurse", "doctor", "clinical", "pharmacist",
-                            "physiotherapist", "occupational therap",
-                            "healthcare", "medical", "gp ", "surgeon",
-                            "dental", "radiographer", "midwife",
-                            "care assistant", "support worker")):
-        return "Healthcare & Medical"
-
-    if any(k in t for k in ("teacher", "lecturer", "professor", "tutor",
-                            "teaching assistant", "education", "headteacher",
-                            "head of department", "send ", "pastoral")):
-        return "Education & Training"
-
-    if any(k in t for k in ("mechanical eng", "electrical eng", "civil eng",
-                            "structural eng", "chemical eng", "process eng",
-                            "manufacturing eng", "maintenance eng",
-                            "building services", "quantity surveyor",
-                            "site manager", "construction manager")):
-        return "Engineering"
-
-    if any(k in t for k in ("solicitor", "barrister", "paralegal", "legal counsel",
-                            "legal advisor", "lawyer", "conveyancer",
-                            "compliance officer", "regulatory")):
-        return "Legal & Compliance"
-
-    if any(k in t for k in ("supply chain", "logistics", "procurement",
-                            "warehouse", "buyer", "purchasing",
-                            "operations manager", "operations director",
-                            "facilities", "fleet manager")):
-        return "Operations & Logistics"
-
-    if any(k in t for k in ("customer service", "customer support",
-                            "call centre", "call center", "contact centre",
-                            "client service", "customer success")):
-        return "Customer Service"
-
-    if any(k in t for k in ("admin", "office manager", "receptionist",
-                            "personal assistant", "executive assistant",
-                            "secretary", "office coordinator")):
-        return "Administration"
-
+    for name, pattern in _CATEGORY_PATTERNS:
+        if pattern.search(t):
+            return name
     return "Other"
 
 
-def normalize_job(job: dict) -> dict:
-    """Ensure all job dicts have every expected field (no undefined in output)."""
-    defaults = {
-        "title": "",
-        "company": "",
-        "location": "",
-        "salary_raw": "",
-        "salary_min": None,
-        "salary_max": None,
-        "salary_currency": "GBP",
-        "salary_period": "",
-        "snippet": "",
+# ──────────────────────────────────────────────────────────────────────
+# Result sink: normalise -> filter -> dedup -> (stream | collect)
+# ──────────────────────────────────────────────────────────────────────
 
-        "employment_type": "",
-        "date_posted": "",
-        "valid_through": "",
-        "url": "",
-        "job_id": "",
-        "source": "",
-        "category": "",
-    }
-    normalized = {**defaults, **{k: v for k, v in job.items() if v is not None and v != ""}}
-    normalized.pop("full_description", None)
-    # Ensure None values don't override defaults for string fields
-    for key in ["title", "company", "location", "salary_raw", "snippet",
-                "employment_type", "date_posted",
-                "valid_through", "url", "job_id", "source", "category",
-                "salary_period", "salary_currency"]:
-        if normalized.get(key) is None:
-            normalized[key] = defaults[key]
-    # Infer category from title when not provided by the board
-    if not normalized["category"]:
-        normalized["category"] = categorize_job(normalized["title"])
-    return normalized
+_NORM = re.compile(r"[^a-z0-9]+")
 
 
-def deduplicate_jobs(jobs: list[dict]) -> list[dict]:
-    """
-    Remove duplicate jobs across boards.
-    Uses a combination of normalised title + company + location.
-    """
-    seen = set()
-    unique = []
+def fingerprint(job: dict) -> str:
+    title = _NORM.sub(" ", job["title"].lower()).strip()
+    company = _NORM.sub(" ", job["company"].lower()).strip()
+    loc = job["location"].lower().split(",")[0].strip()
+    if not company:
+        # Without a company name the title+location key is too coarse; only
+        # treat exact same listing (by id/url) as a duplicate.
+        return f"{job['source']}|{job['job_id'] or job['url']}|{title}"
+    return f"{title}|{company}|{loc}"
 
-    for job in jobs:
-        # Create a fingerprint
-        title = job.get("title", "").lower().strip()
-        company = job.get("company", "").lower().strip()
-        location = job.get("location", "").lower().strip()
 
-        fingerprint = f"{title}|{company}|{location}"
+class ResultSink:
+    def __init__(self, *, deduplicate: bool, salary_min: int | None, currency: str,
+                 posted_within_days: int | None, streaming: bool):
+        self.deduplicate = deduplicate
+        self.salary_min = salary_min
+        self.currency = currency
+        self.posted_within_days = posted_within_days
+        self.streaming = streaming
+        self.seen: set[str] = set()
+        self.per_source: dict[str, list[dict]] = defaultdict(list)
+        self.pushed = 0
+        self.dropped = {"duplicate": 0, "salary": 0, "date": 0}
+        self._pending: list[dict] = []
 
-        if fingerprint not in seen:
-            seen.add(fingerprint)
-            unique.append(job)
+    def normalize(self, job: dict) -> dict:
+        out = {k: job.get(k) for k in OUTPUT_FIELDS}
+        for k in OUTPUT_FIELDS:
+            if k in ("salary_min", "salary_max"):
+                try:
+                    v = float(out[k]) if out[k] not in (None, "") else 0.0
+                except (TypeError, ValueError):
+                    v = 0.0
+                out[k] = round(v) if v > 0 else None
+            elif out[k] is None:
+                out[k] = ""
+            elif not isinstance(out[k], str):
+                out[k] = str(out[k])
+        out["salary_currency"] = out["salary_currency"] or self.currency
+        out["salary_period"] = out["salary_period"] or ("annum" if out["salary_min"] else "")
+        if out["date_posted"]:
+            out["date_posted"] = normalize_date(out["date_posted"]) or out["date_posted"]
+        if out["valid_through"]:
+            out["valid_through"] = normalize_date(out["valid_through"], future_ok=True) or out["valid_through"]
+        if not out["category"]:
+            out["category"] = categorize_job(out["title"])
+        return out
 
-    return unique
+    def accept(self, job: dict) -> bool:
+        if self.salary_min and job["salary_max"] and job["salary_currency"] == self.currency:
+            if annualise(job["salary_max"], job["salary_period"]) < self.salary_min:
+                self.dropped["salary"] += 1
+                return False
+        if self.posted_within_days and re.fullmatch(r"\d{4}-\d{2}-\d{2}", job["date_posted"]):
+            from datetime import date, timedelta
+            cutoff = (date.today() - timedelta(days=self.posted_within_days)).isoformat()
+            if job["date_posted"] < cutoff:
+                self.dropped["date"] += 1
+                return False
+        if self.deduplicate:
+            fp = fingerprint(job)
+            if fp in self.seen:
+                self.dropped["duplicate"] += 1
+                return False
+            self.seen.add(fp)
+        return True
+
+    async def on_page(self, source: str, jobs: list[dict]) -> None:
+        accepted = [j for j in map(self.normalize, jobs) if j["title"] and self.accept(j)]
+        if not accepted:
+            return
+        if self.streaming:
+            await self.push(accepted)
+        else:
+            self.per_source[source].extend(accepted)
+
+    async def push(self, jobs: list[dict]) -> None:
+        for i in range(0, len(jobs), PUSH_BATCH):
+            chunk = jobs[i:i + PUSH_BATCH]
+            # shield: a per-board timeout must not cancel a push half-way and
+            # leave rows marked as seen but never written.
+            await asyncio.shield(Actor.push_data(chunk))
+            self.pushed += len(chunk)
+
+    def interleaved(self, limit: int) -> list[dict]:
+        """Round-robin across boards so no single board dominates the first N rows."""
+        iters = {s: iter(j) for s, j in self.per_source.items() if j}
+        out: list[dict] = []
+        while iters and len(out) < limit:
+            for s in list(iters):
+                job = next(iters[s], None)
+                if job is None:
+                    del iters[s]
+                else:
+                    out.append(job)
+                    if len(out) >= limit:
+                        break
+        return out
 
 
 def compute_salary_benchmarks(jobs: list[dict]) -> list[dict]:
-    """Compute salary benchmarks grouped by title keyword and location."""
-    from collections import defaultdict
-
-    # Group salaries by normalised title + location
-    buckets = defaultdict(list)
+    buckets: dict[tuple[str, str, str], list[float]] = defaultdict(list)
     for job in jobs:
-        sal_min = job.get("salary_min")
-        sal_max = job.get("salary_max")
-        period = job.get("salary_period", "annum")
-
-        # Only use annual salaries for benchmarking
-        if not sal_min and not sal_max:
+        lo, hi = job.get("salary_min"), job.get("salary_max")
+        if not (lo or hi):
             continue
-
-        # Rough annualisation
-        mid = ((sal_min or sal_max) + (sal_max or sal_min)) / 2
-        if period == "day":
-            mid *= 220
-        elif period == "hour":
-            mid *= 1760
-        elif period == "month":
-            mid *= 12
-        elif period == "week":
-            mid *= 52
-
+        mid = annualise(((lo or hi) + (hi or lo)) / 2, job.get("salary_period") or "annum")
         if mid < 5000 or mid > 500000:
-            continue  # filter outliers
-
-        title = job.get("title", "").lower().strip()
-        location = job.get("location", "").lower().strip()
-        # Use first meaningful word of location
-        loc_key = location.split(",")[0].strip() if location else "unknown"
-        buckets[(title, loc_key)].append(mid)
-
-    benchmarks = []
-    for (title, loc), salaries in buckets.items():
-        if len(salaries) < 2:
             continue
-        salaries.sort()
-        benchmarks.append({
-            "benchmark_title": title,
-            "benchmark_location": loc,
-            "count": len(salaries),
-            "salary_mean": round(statistics.mean(salaries)),
-            "salary_median": round(statistics.median(salaries)),
-            "salary_p25": round(salaries[len(salaries) // 4]),
-            "salary_p75": round(salaries[(len(salaries) * 3) // 4]),
-            "salary_min": round(min(salaries)),
-            "salary_max": round(max(salaries)),
-            "_type": "salary_benchmark",
+        title = job["title"].lower().strip()
+        loc = job["location"].lower().split(",")[0].strip() or "unknown"
+        buckets[(title, loc, job["salary_currency"])].append(mid)
+    out = []
+    for (title, loc, cur), vals in buckets.items():
+        if len(vals) < 2:
+            continue
+        vals.sort()
+        out.append({
+            "_type": "salary_benchmark", "benchmark_title": title, "benchmark_location": loc,
+            "salary_currency": cur, "count": len(vals),
+            "salary_mean": round(statistics.mean(vals)), "salary_median": round(statistics.median(vals)),
+            "salary_p25": round(vals[len(vals) // 4]), "salary_p75": round(vals[(len(vals) * 3) // 4]),
+            "salary_min": round(vals[0]), "salary_max": round(vals[-1]),
         })
+    return sorted(out, key=lambda b: b["count"], reverse=True)
 
-    return sorted(benchmarks, key=lambda b: b["count"], reverse=True)
+
+# ──────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────
+
+def _pick(actor_input: dict, preset_key: str, custom_key: str, default: str) -> str:
+    custom = (actor_input.get(custom_key) or "").strip()
+    preset = (actor_input.get(preset_key) or "").strip()
+    if custom:
+        return custom
+    if preset and preset != "__custom__":
+        return preset
+    return default
+
+
+async def run_board(name: str, scraper, keyword: str, location: str, per_board: int,
+                    job_type: str, salary_min: int | None, timeout: float, stats: dict) -> None:
+    """Run one board with a wall-clock budget; results stream out via the sink."""
+    t0 = time.perf_counter()
+    entry = stats.setdefault(name, {"source": scraper.source_name, "jobs": 0, "pages": 0,
+                                    "mode": "", "secs": 0.0, "error": ""})
+    try:
+        await asyncio.wait_for(
+            scraper.search(keyword=keyword, location=location, max_results=per_board,
+                           job_type=job_type, salary_min=salary_min),
+            timeout=timeout)
+    except asyncio.TimeoutError:
+        entry["error"] = f"timeout after {timeout:.0f}s (partial results kept)"
+        scraper.exhausted = True
+        Actor.log.warning(f"[{scraper.source_name}] {entry['error']}")
+    except Exception as e:  # one broken board must never sink the run
+        entry["error"] = f"{type(e).__name__}: {str(e)[:160]}"
+        scraper.exhausted = True
+        Actor.log.exception(f"[{scraper.source_name}] scraper failed")
+    finally:
+        entry["jobs"] = scraper.stats.get("jobs", 0)
+        entry["pages"] = scraper.stats.get("pages", 0)
+        entry["mode"] = scraper.stats.get("mode", "")
+        entry["secs"] = round(entry["secs"] + time.perf_counter() - t0, 1)
 
 
 async def main() -> None:
     async with Actor:
-        # ─── Read Input ────────────────────────────────────────────────
         actor_input = await Actor.get_input() or {}
 
-        # Custom fields override presets when filled in
-        keyword = actor_input.get("custom_keyword") or actor_input.get("keyword", "software engineer")
-        if keyword == "__custom__":
-            keyword = actor_input.get("custom_keyword", "software engineer")
-        location = actor_input.get("custom_location") or actor_input.get("location", "London")
-        if location == "__custom__":
-            location = actor_input.get("custom_location", "London")
+        keyword = _pick(actor_input, "keyword", "custom_keyword", "software engineer")
+        location = _pick(actor_input, "location", "custom_location", "London")
+        country = (actor_input.get("country") or "uk").lower()
+        unlimited = bool(actor_input.get("unlimited", False))
+        max_results = 0 if unlimited else max(int(actor_input.get("max_results") or 100), 100)
+        salary_min = int(actor_input["salary_min"]) if actor_input.get("salary_min") else None
+        job_type = (actor_input.get("job_type") or "all").lower()
+        posted_within_days = int(actor_input["posted_within_days"]) if actor_input.get("posted_within_days") else None
+        deduplicate = bool(actor_input.get("deduplicate", True))
+        salary_benchmark = bool(actor_input.get("salary_benchmark", False))
+        max_pages = int(actor_input.get("max_pages_per_board") or 40)
+        proxy_mode = (actor_input.get("proxy_mode") or "residential").lower()
+        selected = [b for b in (actor_input.get("boards") or COUNTRY_DEFAULTS.get(country, COUNTRY_DEFAULTS["uk"]))
+                    if b in BOARD_REGISTRY]
+        if not selected:
+            Actor.log.error("No valid boards selected")
+            await Actor.set_status_message("No valid boards selected", is_terminal=True)
+            return
 
-        unlimited = actor_input.get("unlimited", False)
-        max_results = 0 if unlimited else max(actor_input.get("max_results", 100), 100)
-        salary_min = actor_input.get("salary_min") or None
-        job_type = actor_input.get("job_type", "all")
-        fetch_details = False  # Detail pages cost extra compute per job
-        country = actor_input.get("country", "uk")
-        salary_benchmark = actor_input.get("salary_benchmark", False)
-
-        # Board selection - use country defaults if empty/not specified
-        selected_boards = actor_input.get("boards") or COUNTRY_DEFAULTS.get(country, COUNTRY_DEFAULTS["uk"])
-
-        # Adzuna API credentials (optional)
-        adzuna_app_id = actor_input.get("adzuna_app_id", "")
-        adzuna_app_key = actor_input.get("adzuna_app_key", "")
-
-        # Deduplication toggle
-        deduplicate = actor_input.get("deduplicate", True)
-
-        Actor.log.info(f"Starting multi-board scrape: '{keyword}' in '{location}' (country={country})")
-        Actor.log.info(f"Boards: {selected_boards}")
-        Actor.log.info(f"Max results: {max_results or 'unlimited'} | Job type: {job_type} | Details: {fetch_details}")
-
-        # ─── Calculate per-board limits ────────────────────────────────
-        # Divide the target evenly across boards.
-        num_boards = len(selected_boards)
-        if max_results == 0:
-            max_per_board = 10000
-        elif num_boards > 0:
-            max_per_board = max_results // num_boards
+        currency = COUNTRY_CURRENCY.get(country, "GBP")
+        n = len(selected)
+        if unlimited:
+            per_board = 10 ** 6
         else:
-            max_per_board = max_results
+            # Over-ask each board by 25% so dedup and short boards still let us
+            # reach the requested total; the sink truncates to max_results.
+            per_board = max(10, math.ceil(max_results * 1.25 / n))
 
-        # ─── Set up Apify proxy config (before httpx client so we can pass proxy) ──
-        headers = make_headers()
+        Actor.log.info(f"Scrape '{keyword}' in '{location}' country={country} boards={selected} "
+                       f"max={'unlimited' if unlimited else max_results} per_board={per_board} type={job_type} "
+                       f"salary_min={salary_min} posted_within={posted_within_days}")
+        await Actor.set_status_message(f"Searching {n} boards for '{keyword}' in '{location}'")
+
+        # ── Proxy (residential, country-targeted, HTML boards only) ──
         proxy_config = None
-        http_proxy_url = None
-        is_on_apify = os.environ.get("APIFY_IS_AT_HOME", "0") == "1"
-        need_browser = any(b in BROWSER_BOARDS for b in selected_boards)
-
-        if is_on_apify:
-            proxy_country = ADZUNA_COUNTRY_MAP.get(country, "GB").upper()
+        html_boards = [b for b in selected if BOARD_REGISTRY[b][1] == "html"]
+        if html_boards and Actor.is_at_home() and proxy_mode != "none":
+            groups = ["RESIDENTIAL"] if proxy_mode == "residential" else None
             try:
                 proxy_config = await Actor.create_proxy_configuration(
-                    groups=["RESIDENTIAL"],
-                    country_code=proxy_country,
-                )
-                http_proxy_url = await proxy_config.new_url(
-                    session_id=f"http_main_{random.randint(1000, 9999)}"
-                )
-                Actor.log.info(f"Using Apify residential proxy ({proxy_country}) for HTTP + browser")
+                    groups=groups, country_code=ADZUNA_COUNTRY.get(country, "gb").upper())
+                Actor.log.info(f"Proxy: {proxy_mode} ({ADZUNA_COUNTRY.get(country, 'gb').upper()}) for {html_boards}")
             except Exception as e:
-                Actor.log.warning(f"Proxy config failed: {e}")
+                Actor.log.warning(f"Proxy configuration failed, continuing without proxy: {e}")
 
-        # ─── Create HTTP client (WITH proxy on Apify for detail page fetching) ──
-        async with httpx.AsyncClient(
-            headers=headers,
-            timeout=30.0,
-            proxy=http_proxy_url,
-        ) as client:
+        browser_pool = BrowserPool(proxy_config=proxy_config) if html_boards else None
+        sink = ResultSink(deduplicate=deduplicate, salary_min=salary_min, currency=currency,
+                          posted_within_days=posted_within_days, streaming=unlimited)
 
-            # ─── Launch Playwright browser if needed ──────────────────
-            browser = None
-            playwright_instance = None
+        direct_client = httpx.AsyncClient(headers=make_api_headers(), timeout=httpx.Timeout(30.0, connect=10.0),
+                                          follow_redirects=True)
+        clients: list[httpx.AsyncClient] = [direct_client]
+        scrapers: dict[str, object] = {}
+        adzuna_country = ADZUNA_COUNTRY.get(country, "gb")
 
-            if need_browser:
-                Actor.log.info("Launching Playwright browser for JS-heavy boards...")
-                try:
-                    playwright_instance = await async_playwright().start()
+        reed_api_key = (actor_input.get("reed_api_key") or "").strip()
+        for board in selected:
+            factory, kind = BOARD_REGISTRY[board]
+            extra: dict = {"on_page": sink.on_page}
+            if board == "reed" and reed_api_key:
+                kind = "api"  # official API: no proxy, no browser
+                extra["api_key"] = reed_api_key
+            if kind == "html":
+                proxy_url = None
+                if proxy_config:
+                    proxy_url = await proxy_config.new_url(session_id=f"{board}_{random.randint(1000, 9999)}")
+                client = httpx.AsyncClient(headers=make_headers(ACCEPT_LANGUAGE.get(country, "en-GB,en;q=0.9")),
+                                           proxy=proxy_url, timeout=httpx.Timeout(25.0, connect=12.0),
+                                           follow_redirects=True)
+                clients.append(client)
+                extra.update(browser_pool=browser_pool, proxy_url=proxy_url, proxy_config=proxy_config)
+            else:
+                client = direct_client
+                if board == "findajob":
+                    # gov.uk wants browser-ish headers but no proxy
+                    client = httpx.AsyncClient(headers=make_headers(), timeout=httpx.Timeout(25.0, connect=12.0),
+                                               follow_redirects=True)
+                    clients.append(client)
+                elif board == "adzuna":
+                    extra.update(app_id=actor_input.get("adzuna_app_id") or "",
+                                 app_key=actor_input.get("adzuna_app_key") or "", country=adzuna_country)
+                elif board == "usajobs":
+                    extra.update(api_key=actor_input.get("usajobs_api_key") or "",
+                                 user_email=actor_input.get("usajobs_user_email") or "")
+            scraper = factory(client, **extra)
+            pages = max_pages if unlimited else min(max_pages, math.ceil(per_board / scraper.page_size) + 1)
+            scraper.max_pages = min(pages, scraper.hard_page_cap) if scraper.hard_page_cap else pages
+            scrapers[board] = scraper
 
-                    # Chromium requires browser-level proxy for context-level proxy to work
-                    # Use a placeholder so per-context proxy overrides are allowed
-                    launch_kwargs = {
-                        "headless": True,
-                        "args": STEALTH_ARGS,
-                    }
-                    if proxy_config:
-                        # Get an initial proxy URL to set at browser level
-                        initial_proxy_url = await proxy_config.new_url(
-                            session_id=f"browser_init_{random.randint(1000, 9999)}"
-                        )
-                        from urllib.parse import urlparse
-                        parsed = urlparse(initial_proxy_url)
-                        launch_kwargs["proxy"] = {
-                            "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
-                            "username": parsed.username or "",
-                            "password": parsed.password or "",
-                        }
-                        Actor.log.info(f"Browser launched with proxy: {parsed.hostname}:{parsed.port}")
+        # ── Run every board concurrently ──
+        pages_needed = math.ceil(per_board / 25)
+        board_timeout = 1800.0 if unlimited else float(max(150, min(900, 60 + 15 * pages_needed)))
+        stats: dict[str, dict] = {}
+        t_start = time.perf_counter()
+        try:
+            await asyncio.gather(*[
+                run_board(name, s, keyword, location, per_board, job_type, salary_min, board_timeout, stats)
+                for name, s in scrapers.items()
+            ])
 
-                    browser = await playwright_instance.chromium.launch(**launch_kwargs)
-                    Actor.log.info("Playwright browser launched successfully")
-                except Exception as e:
-                    Actor.log.error(f"Failed to launch Playwright: {e}")
-                    Actor.log.warning("Browser boards will fall back to httpx (may return fewer results)")
+            # ── Top-up round: if blocked/empty boards left us short, ask the
+            # boards that still have pages for the difference. Cheap (HTTP
+            # pages) and it means users get the number of rows they paid for.
+            if not unlimited:
+                collected = sum(len(v) for v in sink.per_source.values())
+                deficit = max_results - collected
+                live = [b for b, s in scrapers.items() if not s.exhausted]
+                if deficit > 0 and live:
+                    extra = math.ceil(deficit * 1.25 / len(live))
+                    Actor.log.info(f"Top-up: {collected}/{max_results} collected, asking {live} for ~{extra} more each")
+                    for b in live:
+                        s = scrapers[b]
+                        s.max_pages = min(max_pages, s.max_pages + math.ceil(extra / s.page_size) + 1)
+                        if s.hard_page_cap:
+                            s.max_pages = min(s.max_pages, s.hard_page_cap)
+                    await asyncio.gather(*[
+                        run_board(b, scrapers[b], keyword, location, extra, job_type, salary_min,
+                                  max(90.0, board_timeout / 2), stats)
+                        for b in live
+                    ])
 
-            try:
-                # ─── Initialise scrapers (split browser vs API) ───────
-                browser_scrapers = []
-                api_scrapers = []
-                adzuna_country = ADZUNA_COUNTRY_MAP.get(country, "gb")
+            if not unlimited:
+                final = sink.interleaved(max_results)
+                Actor.log.info(f"Pushing {len(final)} rows ({sum(len(v) for v in sink.per_source.values())} collected)")
+                await sink.push(final)
+            else:
+                final = [j for v in sink.per_source.values() for j in v]
 
-                for board_name in selected_boards:
-                    if board_name == "adzuna":
-                        scraper = AdzunaScraper(
-                            client,
-                            delay=0.5,
-                            app_id=adzuna_app_id,
-                            app_key=adzuna_app_key,
-                            country=adzuna_country,
-                        )
-                        api_scrapers.append(scraper)
-
-                    elif board_name in BOARD_REGISTRY:
-                        factory = BOARD_REGISTRY[board_name]
-
-                        if board_name in BROWSER_BOARDS and browser and proxy_config:
-                            # Sanitize board name for session ID (only [\w._~] allowed)
-                            safe_name = re.sub(r"[^a-zA-Z0-9._~]", "_", board_name)
-                            proxy_url = await proxy_config.new_url(
-                                session_id=f"jobs_{safe_name}_{random.randint(1000, 9999)}"
-                            )
-                            if callable(factory) and not isinstance(factory, type):
-                                scraper = factory(client, delay=1.5, browser=browser,
-                                                  proxy_url=proxy_url, proxy_config=proxy_config)
-                            else:
-                                scraper = factory(client, delay=1.5, browser=browser,
-                                                  proxy_url=proxy_url, proxy_config=proxy_config)
-                            browser_scrapers.append(scraper)
-                        elif board_name in BROWSER_BOARDS and browser:
-                            if callable(factory) and not isinstance(factory, type):
-                                scraper = factory(client, delay=1.5, browser=browser)
-                            else:
-                                scraper = factory(client, delay=1.5, browser=browser)
-                            browser_scrapers.append(scraper)
-                        else:
-                            # HTTP-only boards — still pass browser for detail page fallback
-                            extra = {}
-                            if browser:
-                                extra["browser"] = browser
-                            if proxy_config:
-                                safe_name = re.sub(r"[^a-zA-Z0-9._~]", "_", board_name)
-                                purl = await proxy_config.new_url(
-                                    session_id=f"jobs_{safe_name}_{random.randint(1000, 9999)}"
-                                )
-                                extra["proxy_url"] = purl
-                                extra["proxy_config"] = proxy_config
-                            if callable(factory) and not isinstance(factory, type):
-                                scraper = factory(client, delay=0.5, **extra)
-                            else:
-                                scraper = factory(client, delay=0.5, **extra)
-                            api_scrapers.append(scraper)
-
-                        # Pass fetch_details to scrapers that support it
-                        if hasattr(scraper, "fetch_details"):
-                            scraper.fetch_details = fetch_details
-                    else:
-                        Actor.log.warning(f"Unknown board: {board_name}, skipping.")
-
-                all_scrapers = api_scrapers + browser_scrapers
-                if not all_scrapers:
-                    Actor.log.error("No valid boards selected!")
-                    return
-
-                all_jobs = []
-                dedup_seen = set()
-
-                def dedup_and_normalize(jobs: list[dict]) -> list[dict]:
-                    """Normalize and deduplicate a batch of jobs."""
-                    accepted = []
-                    for job in jobs:
-                        normalized = normalize_job(job)
-                        if deduplicate:
-                            fp = (f"{normalized.get('title','').lower().strip()}|"
-                                  f"{normalized.get('company','').lower().strip()}|"
-                                  f"{normalized.get('location','').lower().strip()}")
-                            if fp in dedup_seen:
-                                continue
-                            dedup_seen.add(fp)
-                        accepted.append(normalized)
-                    return accepted
-
+            if salary_benchmark:
+                source = final if not unlimited else []
                 if unlimited:
-                    # ─── UNLIMITED MODE ───────────────────────────────
-                    # Each board gets 100 per pass. Cycle through all
-                    # boards, pushing after each one so results survive
-                    # if the user aborts mid-run.
-                    BATCH = 100
-                    Actor.log.info("Unlimited mode: cycling boards in rounds of 100...")
+                    Actor.log.info("Salary benchmarks: computed from the dataset in unlimited mode")
+                    ds = await Actor.open_dataset()
+                    source = [i async for i in ds.iterate_items()]
+                benches = compute_salary_benchmarks(source)
+                if benches:
+                    await Actor.push_data(benches)
+                Actor.log.info(f"Generated {len(benches)} salary benchmarks")
+        finally:
+            for c in clients:
+                try:
+                    await c.aclose()
+                except Exception:
+                    pass
+            if browser_pool:
+                await browser_pool.close()
 
-                    # Run all scrapers once with 100 each, push as we go
-                    # API scrapers in parallel first
-                    if api_scrapers:
-                        Actor.log.info(f"Running {len(api_scrapers)} API scrapers in parallel...")
-                        api_results = await asyncio.gather(
-                            *[run_board(s, keyword, location, BATCH, job_type, salary_min)
-                              for s in api_scrapers],
-                        )
-                        for scraper, jobs in zip(api_scrapers, api_results):
-                            accepted = dedup_and_normalize(jobs)
-                            Actor.log.info(f"[{scraper.source_name}] {len(jobs)} scraped, {len(accepted)} pushed")
-                            for job in accepted:
-                                await Actor.push_data(job)
-                            all_jobs.extend(accepted)
-
-                    # Browser scrapers sequentially
-                    if browser_scrapers:
-                        for scraper in browser_scrapers:
-                            Actor.log.info(f"── Starting {scraper.source_name} ──")
-                            jobs = await run_board(scraper, keyword, location, BATCH, job_type, salary_min)
-                            accepted = dedup_and_normalize(jobs)
-                            Actor.log.info(f"[{scraper.source_name}] {len(jobs)} scraped, {len(accepted)} pushed")
-                            for job in accepted:
-                                await Actor.push_data(job)
-                            all_jobs.extend(accepted)
-
-                else:
-                    # ─── LIMITED MODE ─────────────────────────────────
-                    # Split the target evenly across boards. Collect all,
-                    # then deduplicate, interleave, and push.
-                    board_results = {}
-
-                    if api_scrapers:
-                        Actor.log.info(f"Running {len(api_scrapers)} API scrapers in parallel...")
-                        api_results = await asyncio.gather(
-                            *[run_board(s, keyword, location, max_per_board, job_type, salary_min)
-                              for s in api_scrapers],
-                        )
-                        for scraper, jobs in zip(api_scrapers, api_results):
-                            Actor.log.info(f"═══ {scraper.source_name} returned {len(jobs)} jobs ═══")
-                            board_results[scraper.source_name] = jobs
-
-                    if browser_scrapers:
-                        Actor.log.info(f"Running {len(browser_scrapers)} browser scrapers sequentially...")
-                        for scraper in browser_scrapers:
-                            Actor.log.info(f"── Starting {scraper.source_name} ──")
-                            jobs = await run_board(scraper, keyword, location, max_per_board, job_type, salary_min)
-                            Actor.log.info(f"═══ {scraper.source_name} returned {len(jobs)} jobs ═══")
-                            board_results[scraper.source_name] = jobs
-
-                    # Normalize + dedup per board
-                    for source in board_results:
-                        board_results[source] = dedup_and_normalize(board_results[source])
-                        Actor.log.info(f"[{source}] {len(board_results[source])} after dedup")
-
-                    # Round-robin interleave for fair representation
-                    board_iters = {src: iter(jobs) for src, jobs in board_results.items() if jobs}
-                    while board_iters:
-                        exhausted = []
-                        for src in list(board_iters):
-                            job = next(board_iters[src], None)
-                            if job is None:
-                                exhausted.append(src)
-                            else:
-                                all_jobs.append(job)
-                        for src in exhausted:
-                            del board_iters[src]
-
-                    # Push all
-                    Actor.log.info(f"Pushing {len(all_jobs)} jobs to dataset...")
-                    for job in all_jobs:
-                        await Actor.push_data(job)
-
-                # ─── Salary benchmarks ────────────────────────────────
-                if salary_benchmark:
-                    benchmarks = compute_salary_benchmarks(all_jobs)
-                    Actor.log.info(f"Generated {len(benchmarks)} salary benchmarks")
-                    for b in benchmarks:
-                        await Actor.push_data(b)
-
-            finally:
-                # ─── Clean up browser ─────────────────────────────────
-                if browser:
-                    try:
-                        await browser.close()
-                    except Exception:
-                        pass
-                if playwright_instance:
-                    try:
-                        await playwright_instance.stop()
-                    except Exception:
-                        pass
-
-        # ─── Summary ──────────────────────────────────────────────────
-        source_counts = {}
-        for job in all_jobs:
-            src = job.get("source", "unknown")
-            source_counts[src] = source_counts.get(src, 0) + 1
-
-        Actor.log.info(f"╔══════════════════════════════════════╗")
-        Actor.log.info(f"║  SCRAPE COMPLETE                     ║")
-        Actor.log.info(f"║  Total jobs: {len(all_jobs):<23}║")
-        for src, count in sorted(source_counts.items()):
-            Actor.log.info(f"║  {src}: {count:<26}║")
-        Actor.log.info(f"╚══════════════════════════════════════╝")
+        # ── Summary ──
+        elapsed = round(time.perf_counter() - t_start, 1)
+        summary = {
+            "keyword": keyword, "location": location, "country": country, "boards": selected,
+            "rows_pushed": sink.pushed, "dropped": sink.dropped, "elapsed_secs": elapsed,
+            "browser_launched": bool(browser_pool and browser_pool.launched),
+            "per_board": stats,
+        }
+        await Actor.set_value("RUN_STATS", summary)
+        Actor.log.info("══════════ SCRAPE COMPLETE ══════════")
+        Actor.log.info(f"rows={sink.pushed} dropped={sink.dropped} elapsed={elapsed}s browser={'yes' if summary['browser_launched'] else 'no'}")
+        for name, e in stats.items():
+            Actor.log.info(f"  {e['source']:<22} {e['jobs']:>5} jobs  {e['pages']:>3} pages  {e['mode']:<8} {e['secs']:>6}s  {e['error']}")
+        await Actor.set_status_message(
+            f"Done: {sink.pushed} jobs from {sum(1 for e in stats.values() if e['jobs'])}/{n} boards in {elapsed}s",
+            is_terminal=True)
 
 
 if __name__ == "__main__":

@@ -1,141 +1,102 @@
-"""Adzuna.co.uk job board scraper via their public API."""
+"""Adzuna via its official API (free keys at https://developer.adzuna.com)."""
+
+from __future__ import annotations
 
 from urllib.parse import quote_plus
 
 from apify import Actor
 
-from ..utils import BaseScraper, clean_text
+from ..utils import BaseScraper, apply_salary, clean_text, detect_work_mode
 
-# Adzuna has a free API - users need to register at https://developer.adzuna.com
-# to get their own app_id and app_key
 API_BASE = "https://api.adzuna.com/v1/api/jobs/{country}/search"
-
-JOB_TYPE_MAP = {
-    "all": {},
-    "permanent": {"permanent": "1"},
-    "temporary": {"contract": "1"},
-    "contract": {"contract": "1"},
-    "part-time": {"part_time": "1"},
-}
+JOB_TYPE_PARAM = {"permanent": {"permanent": "1"}, "temporary": {"contract": "1"},
+                  "contract": {"contract": "1"}, "part-time": {"part_time": "1"}}
+COUNTRY_CURRENCY = {"gb": "GBP", "us": "USD", "au": "AUD", "de": "EUR", "fr": "EUR", "nl": "EUR",
+                    "at": "EUR", "be": "EUR", "it": "EUR", "es": "EUR", "pl": "PLN", "ca": "CAD",
+                    "nz": "NZD", "sg": "SGD", "in": "INR", "br": "BRL", "mx": "MXN", "za": "ZAR", "ch": "CHF"}
+SYMBOL = {"GBP": "£", "USD": "$", "EUR": "€", "AUD": "A$", "CAD": "C$", "NZD": "NZ$"}
 
 
 class AdzunaScraper(BaseScraper):
+    page_size = 50
 
-    def __init__(self, client, delay: float = 0.5, app_id: str = "", app_key: str = "", country: str = "gb", **kwargs):
+    def __init__(self, client, delay: float = 0.3, app_id: str = "", app_key: str = "", country: str = "gb", **kwargs):
         super().__init__(client, delay, **kwargs)
-        self.app_id = app_id
-        self.app_key = app_key
+        self.app_id = (app_id or "").strip()
+        self.app_key = (app_key or "").strip()
         self.country = country
-        self.api_base = API_BASE.format(country=country)
+        self.default_currency = COUNTRY_CURRENCY.get(country, "GBP")
 
     @property
     def source_name(self) -> str:
         return f"adzuna.{self.country}"
 
-    def _build_url(self, keyword: str, location: str, job_type: str,
-                   salary_min: int | None, page: int, per_page: int = 20) -> str:
-        params = [
-            f"app_id={self.app_id}",
-            f"app_key={self.app_key}",
-            f"results_per_page={per_page}",
-            f"what={quote_plus(keyword)}",
-            f"where={quote_plus(location)}",
-            "sort_by=date",
-            "content-type=application/json",
-        ]
-
-        type_params = JOB_TYPE_MAP.get(job_type, {})
-        for k, v in type_params.items():
-            params.append(f"{k}={v}")
-
-        if salary_min:
-            params.append(f"salary_min={salary_min}")
-
-        return f"{self.api_base}/{page}?" + "&".join(params)
-
-    async def search(self, keyword: str, location: str, max_results: int = 50,
-                     job_type: str = "all", salary_min: int | None = None) -> list[dict]:
+    async def search(self, keyword, location, max_results=50, job_type="all", salary_min=None) -> list[dict]:
+        self.stats["mode"] = "api"
+        all_jobs: list[dict] = []
+        if self.exhausted:
+            return all_jobs
         if not self.app_id or not self.app_key:
-            Actor.log.warning("[Adzuna] Skipping - no API credentials provided. Register at https://developer.adzuna.com")
-            return []
-
-        all_jobs = []
-        page = 1
-        per_page = min(50, max_results)
-
-        while len(all_jobs) < max_results:
-            url = self._build_url(keyword, location, job_type, salary_min, page, per_page)
-            Actor.log.info(f"[Adzuna] Fetching API page {page}")
-
-            data = await self._fetch_json(url)
+            Actor.log.warning("[Adzuna] skipped: no API credentials (free at https://developer.adzuna.com)")
+            self.exhausted = True
+            return all_jobs
+        page = self._page
+        while len(all_jobs) < max_results and page <= self.max_pages:
+            # Always a full page: page N must mean the same window on every call
+            params = [f"app_id={self.app_id}", f"app_key={self.app_key}", f"results_per_page={self.page_size}",
+                      f"what={quote_plus(keyword)}", f"where={quote_plus(location)}", "sort_by=date",
+                      "content-type=application/json"]
+            for k, v in JOB_TYPE_PARAM.get(job_type, {}).items():
+                params.append(f"{k}={v}")
+            if salary_min:
+                params.append(f"salary_min={int(salary_min)}")
+            data = await self._fetch_json(f"{API_BASE.format(country=self.country)}/{page}?" + "&".join(params))
             if not data:
                 break
-
-            results = data.get("results", [])
+            results = data.get("results") or []
             if not results:
-                Actor.log.info(f"[Adzuna] No results on page {page}, stopping.")
+                self.exhausted = True
                 break
-
-            for item in results:
-                if len(all_jobs) >= max_results:
-                    break
-
-                job = self._parse_result(item)
-                all_jobs.append(job)
-
-            # Check if there are more results
-            total = data.get("count", 0)
-            if len(all_jobs) >= total or len(all_jobs) >= max_results:
-                break
-
+            fresh = [self._parse_result(it) for it in results]
+            all_jobs.extend(fresh)
+            self.stats["pages"] += 1
+            self.stats["jobs"] += len(fresh)
+            Actor.log.info(f"[Adzuna] page {page}: +{len(fresh)} (run total {self.stats['jobs']}/{data.get('count', '?')})")
+            if self.on_page:
+                await self.on_page(self.source_name, fresh)
             page += 1
+            self._page = page
+            if self.stats["jobs"] >= int(data.get("count", 0) or 0):
+                self.exhausted = True
+                break
             await self._polite_delay()
-
-        Actor.log.info(f"[Adzuna] Total scraped: {len(all_jobs)}")
         return all_jobs
 
-    def _parse_result(self, item: dict) -> dict:
-        """Parse a single Adzuna API result into unified format."""
-        location_data = item.get("location", {})
-        display_name = location_data.get("display_name", "")
-
-        salary_min = item.get("salary_min")
-        salary_max = item.get("salary_max")
-
-        # Determine period from contract_time
-        period = "annum"
-        contract_time = item.get("contract_time", "")
-
-        # Build salary raw string
-        salary_raw = ""
-        if salary_min and salary_max:
-            if salary_min == salary_max:
-                salary_raw = f"£{salary_min:,.0f} per {period}"
-            else:
-                salary_raw = f"£{salary_min:,.0f} - £{salary_max:,.0f} per {period}"
-
-        # Predicted salary flag
-        is_predicted = item.get("salary_is_predicted", 0)
-        if is_predicted and salary_raw:
-            salary_raw += " (estimated)"
-
-        company = item.get("company", {})
-        category = item.get("category", {})
-
-        return {
-            "title": clean_text(item.get("title", "")),
-            "company": company.get("display_name", "") if isinstance(company, dict) else str(company),
-            "location": display_name,
-            "salary_raw": salary_raw,
-            "salary_min": salary_min,
-            "salary_max": salary_max,
-            "salary_period": period,
-            "snippet": clean_text(item.get("description", ""))[:500],
-            "full_description": clean_text(item.get("description", "")),
-            "employment_type": item.get("contract_type", ""),
-            "date_posted": item.get("created", ""),
-            "url": item.get("redirect_url", ""),
-            "job_id": str(item.get("id", "")),
+    def _parse_result(self, it: dict) -> dict:
+        company = it.get("company") or {}
+        category = it.get("category") or {}
+        desc = clean_text(it.get("description", ""))
+        job = {
             "source": self.source_name,
+            "title": clean_text(it.get("title", "")),
+            "company": clean_text(company.get("display_name", "") if isinstance(company, dict) else str(company)),
+            "location": clean_text((it.get("location") or {}).get("display_name", "")),
+            "snippet": desc[:500],
+            "employment_type": clean_text(it.get("contract_type", "")).replace("_", "-").title(),
+            "date_posted": it.get("created", ""),
+            "url": it.get("redirect_url", ""),
+            "job_id": str(it.get("id", "")),
             "category": category.get("label", "") if isinstance(category, dict) else "",
+            "salary_currency": self.default_currency,
         }
+        lo, hi = it.get("salary_min"), it.get("salary_max")
+        if lo or hi:
+            lo = float(lo or hi)
+            hi = float(hi or lo)
+            sym = SYMBOL.get(self.default_currency, self.default_currency + " ")
+            raw = f"{sym}{lo:,.0f} per annum" if lo == hi else f"{sym}{lo:,.0f} - {sym}{hi:,.0f} per annum"
+            if it.get("salary_is_predicted") in (1, "1", True):
+                raw += " (estimated)"
+            apply_salary(job, {"raw": raw, "min": lo, "max": hi, "currency": self.default_currency, "period": "annum"})
+        job["work_mode"] = detect_work_mode(job["title"], job["location"], desc[:300])
+        return job

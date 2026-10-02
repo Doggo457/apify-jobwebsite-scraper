@@ -1,0 +1,242 @@
+{
+    "actorSpecification": 1,
+    "fields": {
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "title": "Job Title",
+                "description": "Job title",
+                "example": "Junior Software Engineer"
+            },
+            "company": {
+                "type": "string",
+                "title": "Company",
+                "description": "Hiring company name",
+                "example": "TechCorp Ltd"
+            },
+            "location": {
+                "type": "string",
+                "title": "Location",
+                "description": "Job location",
+                "example": "London"
+            },
+            "salary_raw": {
+                "type": "string",
+                "title": "Salary",
+                "description": "Original salary text from the listing",
+                "example": "£30,000 - £40,000 per annum"
+            },
+            "salary_min": {
+                "type": [
+                    "integer",
+                    "null"
+                ],
+                "title": "Salary Min",
+                "description": "Parsed minimum salary",
+                "example": 30000
+            },
+            "salary_max": {
+                "type": [
+                    "integer",
+                    "null"
+                ],
+                "title": "Salary Max",
+                "description": "Parsed maximum salary",
+                "example": 40000
+            },
+            "salary_currency": {
+                "type": "string",
+                "title": "Currency",
+                "description": "ISO currency code of the parsed salary (GBP, USD, EUR, AUD)",
+                "example": "GBP"
+            },
+            "salary_period": {
+                "type": "string",
+                "title": "Salary Period",
+                "description": "Salary period — annum, day, or hour",
+                "example": "annum"
+            },
+            "employment_type": {
+                "type": "string",
+                "title": "Employment Type",
+                "description": "Permanent, Contract, Temporary, or Part-time",
+                "example": "Permanent"
+            },
+            "work_mode": {
+                "type": "string",
+                "title": "Work Mode",
+                "description": "Remote, Hybrid or On-site where the listing states it",
+                "example": "Hybrid"
+            },
+            "snippet": {
+                "type": "string",
+                "title": "Snippet",
+                "description": "Short description from search results",
+                "example": "We are looking for a passionate junior developer to join our growing team..."
+            },
+            "date_posted": {
+                "type": "string",
+                "title": "Date Posted",
+                "description": "When the job was listed, normalised to ISO date (YYYY-MM-DD) wherever the board gives a readable date",
+                "example": "2026-03-05"
+            },
+            "valid_through": {
+                "type": "string",
+                "title": "Valid Through",
+                "description": "Application deadline or listing expiry (ISO date where available)",
+                "example": "2026-04-05"
+            },
+            "url": {
+                "type": "string",
+                "title": "URL",
+                "description": "Direct link to the job listing",
+                "example": "https://www.reed.co.uk/jobs/junior-software-engineer/12345"
+            },
+            "job_id": {
+                "type": "string",
+                "title": "Job ID",
+                "description": "Unique ID from the source board",
+                "example": "12345"
+            },
+            "source": {
+                "type": "string",
+                "title": "Source",
+                "description": "Which job board the listing came from (reed.co.uk, totaljobs.com, cwjobs.co.uk, cv-library.co.uk, indeed.co.uk, jobs.service.gov.uk, usajobs.gov, adzuna.gb, remoteok.com, arbeitnow.com, ...)",
+                "example": "reed.co.uk"
+            },
+            "category": {
+                "type": "string",
+                "title": "Category",
+                "description": "Job category: from the board where it provides one (Adzuna, USAJobs), otherwise inferred from the title",
+                "example": "Software Development"
+            },
+            "_type": {
+                "type": "string",
+                "title": "Record Type",
+                "description": "Record type — absent for jobs, 'salary_benchmark' for benchmarks",
+                "example": "salary_benchmark"
+            },
+            "benchmark_title": {
+                "type": "string",
+                "title": "Benchmark Title",
+                "description": "Job title used for salary benchmark grouping"
+            },
+            "benchmark_location": {
+                "type": "string",
+                "title": "Benchmark Location",
+                "description": "Location used for salary benchmark grouping"
+            },
+            "count": {
+                "type": "integer",
+                "title": "Sample Count",
+                "description": "Number of salary data points in this benchmark"
+            },
+            "salary_mean": {
+                "type": "integer",
+                "title": "Mean Salary",
+                "description": "Mean annual salary for this benchmark group"
+            },
+            "salary_median": {
+                "type": "integer",
+                "title": "Median Salary",
+                "description": "Median annual salary for this benchmark group"
+            },
+            "salary_p25": {
+                "type": "integer",
+                "title": "25th Percentile",
+                "description": "25th percentile annual salary"
+            },
+            "salary_p75": {
+                "type": "integer",
+                "title": "75th Percentile",
+                "description": "75th percentile annual salary"
+            }
+        }
+    },
+    "views": {
+        "jobs": {
+            "title": "Job Listings",
+            "description": "All scraped job listings across selected boards",
+            "transformation": {
+                "fields": [
+                    "title",
+                    "company",
+                    "location",
+                    "salary_raw",
+                    "salary_min",
+                    "salary_max",
+                    "salary_currency",
+                    "employment_type",
+                    "work_mode",
+                    "date_posted",
+                    "url",
+                    "source",
+                    "category",
+                    "snippet"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "title": {
+                        "label": "Job Title",
+                        "format": "text"
+                    },
+                    "company": {
+                        "label": "Company",
+                        "format": "text"
+                    },
+                    "location": {
+                        "label": "Location",
+                        "format": "text"
+                    },
+                    "salary_raw": {
+                        "label": "Salary",
+                        "format": "text"
+                    },
+                    "salary_min": {
+                        "label": "Min",
+                        "format": "number"
+                    },
+                    "salary_max": {
+                        "label": "Max",
+                        "format": "number"
+                    },
+                    "salary_currency": {
+                        "label": "Currency",
+                        "format": "text"
+                    },
+                    "employment_type": {
+                        "label": "Type",
+                        "format": "text"
+                    },
+                    "work_mode": {
+                        "label": "Work Mode",
+                        "format": "text"
+                    },
+                    "date_posted": {
+                        "label": "Posted",
+                        "format": "text"
+                    },
+                    "url": {
+                        "label": "Link",
+                        "format": "link"
+                    },
+                    "source": {
+                        "label": "Source",
+                        "format": "text"
+                    },
+                    "category": {
+                        "label": "Category",
+                        "format": "text"
+                    },
+                    "snippet": {
+                        "label": "Description",
+                        "format": "text"
+                    }
+                }
+            }
+        }
+    }
+}

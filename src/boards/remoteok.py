@@ -1,83 +1,79 @@
-"""RemoteOK.com scraper — free JSON API for remote jobs worldwide."""
+"""RemoteOK.com via its public JSON feed.
 
-from urllib.parse import quote_plus
+The feed's `?tag=` filter only understands single-word tags (`dev`,
+`engineer`, `python`); a multi-word keyword like `software-engineer` returns
+nothing but the legal notice. We fetch the full feed once (~0.5 MB, one
+request) and filter client-side on keyword tokens, which is both cheaper and
+correct for any keyword.
+"""
+
+from __future__ import annotations
+
+import re
 
 from apify import Actor
 
-from ..utils import BaseScraper, clean_text
-
+from ..utils import BaseScraper, apply_salary, clean_text
 
 API_URL = "https://remoteok.com/api"
+_STOP = {"and", "or", "the", "a", "an", "of", "in", "for", "to", "jobs", "job"}
+
+
+def keyword_tokens(keyword: str) -> list[str]:
+    toks = [t for t in re.split(r"[^a-z0-9+#.]+", keyword.lower()) if t and t not in _STOP]
+    return toks or [keyword.lower().strip()]
 
 
 class RemoteOKScraper(BaseScraper):
+    default_currency = "USD"
 
     @property
     def source_name(self) -> str:
         return "remoteok.com"
 
-    async def search(self, keyword: str, location: str, max_results: int = 50,
-                     job_type: str = "all", salary_min: int | None = None) -> list[dict]:
-        """RemoteOK returns all jobs in a single API call (no pagination)."""
-        # The API supports tag-based filtering via URL path
-        tag = quote_plus(keyword.lower().replace(" ", "-"))
-        url = f"{API_URL}?tag={tag}"
-
-        Actor.log.info(f"[RemoteOK] Fetching API: {url}")
-
-        try:
-            response = await self.client.get(url, follow_redirects=True, headers={
-                "User-Agent": "jobscraper/1.0",
-            })
-            response.raise_for_status()
-            data = response.json()
-        except Exception as e:
-            Actor.log.warning(f"[RemoteOK] API request failed: {e}")
+    async def search(self, keyword, location, max_results=50, job_type="all", salary_min=None) -> list[dict]:
+        self.stats["mode"] = "api"
+        if self.exhausted:
             return []
-
+        self.exhausted = True  # single feed, nothing to page through
+        data = await self._fetch_json(API_URL, headers={"User-Agent": "jobs-board-scraper/1.0 (apify)", "Accept": "application/json"})
         if not isinstance(data, list):
             return []
-
-        # First item is usually a legal notice, skip it
-        items = [item for item in data if isinstance(item, dict) and item.get("id")]
-
-        all_jobs = []
-        for item in items:
-            if len(all_jobs) >= max_results:
-                break
-
-            sal_min = item.get("salary_min")
-            sal_max = item.get("salary_max")
-
-            # Apply salary filter
-            if salary_min and sal_max and sal_max < salary_min:
+        toks = keyword_tokens(keyword)
+        all_jobs: list[dict] = []
+        for it in data:
+            if not isinstance(it, dict) or not it.get("id"):
                 continue
-
-            salary_raw = ""
-            if sal_min and sal_max:
-                salary_raw = f"${sal_min:,} - ${sal_max:,} per year"
-            elif sal_min:
-                salary_raw = f"${sal_min:,}+ per year"
-
-            tags = item.get("tags", [])
-            if isinstance(tags, list):
-                tags = ", ".join(tags[:5])
-
-            all_jobs.append({
-                "title": clean_text(item.get("position", "")),
-                "company": item.get("company", ""),
-                "location": item.get("location", "Remote"),
-                "salary_raw": salary_raw,
-                "salary_min": sal_min,
-                "salary_max": sal_max,
-                "salary_period": "annum",
-                "snippet": clean_text(item.get("description", ""))[:500],
-                "date_posted": item.get("date", ""),
-                "url": item.get("url", ""),
-                "job_id": str(item.get("id", "")),
+            hay = f"{it.get('position', '')} {' '.join(it.get('tags') or [])} {it.get('description', '')}".lower()
+            if not all(t in hay for t in toks):
+                continue
+            lo, hi = it.get("salary_min") or None, it.get("salary_max") or None
+            if salary_min and hi and hi < salary_min:
+                continue
+            job = {
                 "source": self.source_name,
-                "category": tags if isinstance(tags, str) else "",
-            })
-
-        Actor.log.info(f"[RemoteOK] Total scraped: {len(all_jobs)}")
+                "title": clean_text(it.get("position", "")),
+                "company": clean_text(it.get("company", "")),
+                "location": clean_text(it.get("location") or "Remote") or "Remote",
+                "snippet": clean_text(re.sub(r"<[^>]+>", " ", it.get("description") or ""))[:500],
+                "date_posted": it.get("date", "") or it.get("epoch", ""),
+                "url": it.get("url", ""),
+                "job_id": str(it.get("id", "")),
+                "category": ", ".join((it.get("tags") or [])[:5]),
+                "work_mode": "Remote",
+                "salary_currency": "USD",
+            }
+            if lo or hi:
+                lo = float(lo or hi)
+                hi = float(hi or lo)
+                raw = f"${lo:,.0f} per year" if lo == hi else f"${lo:,.0f} - ${hi:,.0f} per year"
+                apply_salary(job, {"raw": raw, "min": lo, "max": hi, "currency": "USD", "period": "annum"})
+            all_jobs.append(job)
+        # Every match is emitted (main.py truncates to the global cap); holding
+        # some back would lose them since this board never runs a second time.
+        self.stats["pages"] = 1
+        self.stats["jobs"] = len(all_jobs)
+        Actor.log.info(f"[RemoteOK] {len(all_jobs)} matched '{keyword}' out of {len(data)} feed items")
+        if self.on_page and all_jobs:
+            await self.on_page(self.source_name, all_jobs)
         return all_jobs

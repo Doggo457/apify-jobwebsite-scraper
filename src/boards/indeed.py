@@ -1,4 +1,11 @@
-"""Indeed job board scraper — supports UK and international variants."""
+"""Indeed scraper (UK + international variants).
+
+Indeed sits behind an aggressive Cloudflare challenge; even residential
+proxies plus a stealth browser get through only some of the time. Treat it
+as best-effort and the most expensive board in the set.
+"""
+
+from __future__ import annotations
 
 import json
 import re
@@ -7,282 +14,140 @@ from urllib.parse import quote_plus, urljoin
 from apify import Actor
 from bs4 import BeautifulSoup
 
-from ..utils import BaseScraper, parse_salary, clean_text
+from ..utils import (BaseScraper, apply_salary, clean_text, detect_employment_type,
+                     detect_work_mode, parse_salary, strip_tracking)
 
-BASE_URL = "https://uk.indeed.com"  # Default for IndeedUKScraper
+JOB_TYPE_PARAM = {"permanent": "permanent", "temporary": "temporary", "contract": "contract", "part-time": "parttime"}
+# NOTE: BeautifulSoup is only used for the HTML-card fallback; the mosaic JSON path needs no parsing.
 
-JOB_TYPE_MAP = {
-    "all": "",
-    "permanent": "permanent",
-    "temporary": "temporary",
-    "contract": "contract",
-    "part-time": "part-time",
-}
+_MOSAIC_MARK = re.compile(r'window\.mosaic\.providerData\["mosaic-provider-jobcards"\]\s*=\s*')
+_JOBCARDS_MARK = re.compile(r'"jobCards"\s*:\s*')
+_DECODER = json.JSONDecoder()
 
 
-class IndeedUKScraper(BaseScraper):
+def _json_after(html: str, marker: re.Pattern) -> dict | list | None:
+    """Decode exactly one JSON value that starts right after `marker`.
+
+    raw_decode handles nested brackets and strings properly, which a
+    non-greedy regex cannot.
     """
-    Indeed UK scraper.
-    Note: Indeed has very aggressive anti-bot measures. Even with residential
-    proxies, results may be limited. Falls back to JSON-LD extraction when
-    available.
-    """
+    m = marker.search(html)
+    if not m:
+        return None
+    try:
+        value, _ = _DECODER.raw_decode(html, m.end())
+        return value
+    except (json.JSONDecodeError, ValueError):
+        return None
 
-    def __init__(self, client, delay: float = 1.5, **kwargs):
+
+class IndeedScraper(BaseScraper):
+    card_selector = "div.job_seen_beacon, div[data-jk], a[data-jk]"
+    page_size = 15
+    max_pages = 20
+
+    def __init__(self, client, delay: float = 1.5, base_url: str = "https://uk.indeed.com",
+                 source: str = "indeed.co.uk", currency: str = "GBP", **kwargs):
         super().__init__(client, delay, **kwargs)
-        self.fetch_details = False
-
-    @property
-    def source_name(self) -> str:
-        return "indeed.co.uk"
-
-    def _build_url(self, keyword: str, location: str, job_type: str,
-                   salary_min: int | None, start: int = 0) -> str:
-        params = [
-            f"q={quote_plus(keyword)}",
-            f"l={quote_plus(location)}",
-            "sort=date",
-        ]
-
-        if start > 0:
-            params.append(f"start={start}")
-
-        indeed_type = JOB_TYPE_MAP.get(job_type, "")
-        if indeed_type:
-            params.append(f"jt={indeed_type}")
-
-        if salary_min:
-            params.append(f"salary={salary_min}")
-
-        return f"{BASE_URL}/jobs?" + "&".join(params)
-
-    async def search(self, keyword: str, location: str, max_results: int = 50,
-                     job_type: str = "all", salary_min: int | None = None) -> list[dict]:
-        all_jobs = []
-        start = 0
-
-        while len(all_jobs) < max_results:
-            url = self._build_url(keyword, location, job_type, salary_min, start)
-            Actor.log.info(f"[Indeed UK] Scraping offset {start}: {url}")
-
-            html = await self._get_html(url)
-            if not html:
-                Actor.log.warning("[Indeed UK] Failed to fetch - Indeed requires browser rendering or residential proxy")
-                break
-
-            jobs, has_next = self._parse_search(html)
-            if not jobs:
-                Actor.log.info(f"[Indeed UK] No jobs at offset {start}, stopping.")
-                break
-
-            for job in jobs:
-                if len(all_jobs) >= max_results:
-                    break
-
-                # Fetch detail page if enabled and job has a URL
-                if self.fetch_details and job.get("url"):
-                    detail = await self._parse_detail_page(job["url"])
-                    for k, v in detail.items():
-                        if v and not job.get(k):
-                            job[k] = v
-                    await self._polite_delay()
-
-                all_jobs.append(job)
-
-            if not has_next or len(all_jobs) >= max_results:
-                break
-
-            start += 10
-            await self._polite_delay()
-
-        Actor.log.info(f"[Indeed UK] Total scraped: {len(all_jobs)}")
-        return all_jobs
-
-    async def _parse_detail_page(self, url: str) -> dict:
-        html = await self._fetch_detail(url)
-        if not html:
-            return {}
-        jsonld_jobs = self._extract_jsonld_jobs(html)
-        if jsonld_jobs:
-            return jsonld_jobs[0]
-        soup = BeautifulSoup(html, "html.parser")
-        details = {}
-        for sel in ['[id="jobDescriptionText"]', '[class*="jobsearch-jobDescriptionText"]',
-                    '[class*="description"]', '[itemprop="description"]']:
-            el = soup.select_one(sel)
-            if el and len(el.get_text(strip=True)) > 50:
-                details["full_description"] = el.get_text(separator="\n", strip=True)
-                details["snippet"] = clean_text(el.get_text())[:500]
-                break
-        for sel in ['[data-testid="inlineHeader-companyName"]', '[class*="companyName"]',
-                    '[itemprop="hiringOrganization"]']:
-            el = soup.select_one(sel)
-            if el:
-                details["company"] = clean_text(el.get_text())
-                break
-        for sel in ['[data-testid="inlineHeader-companyLocation"]', '[class*="companyLocation"]',
-                    '[itemprop="jobLocation"]']:
-            el = soup.select_one(sel)
-            if el:
-                details["location"] = clean_text(el.get_text())
-                break
-        for sel in ['[id="salaryInfoAndJobType"]', '[class*="salary"]', '[itemprop="baseSalary"]']:
-            el = soup.select_one(sel)
-            if el:
-                sal = parse_salary(el.get_text())
-                details["salary_raw"] = sal["raw"]
-                details["salary_min"] = sal["min"]
-                details["salary_max"] = sal["max"]
-                details["salary_period"] = sal["period"]
-                break
-        return details
-
-    def _parse_search(self, html: str) -> tuple[list[dict], bool]:
-        # Try JSON-LD first
-        jsonld_jobs = self._extract_jsonld_jobs(html)
-        if jsonld_jobs:
-            Actor.log.info(f"[Indeed UK] Found {len(jsonld_jobs)} jobs via JSON-LD")
-            return jsonld_jobs, len(jsonld_jobs) >= 10
-
-        # Try to extract from Indeed's mosaic data (embedded JSON)
-        jobs = self._extract_mosaic_data(html)
-        if jobs:
-            Actor.log.info(f"[Indeed UK] Found {len(jobs)} jobs via mosaic data")
-            return jobs, len(jobs) >= 10
-
-        # Fallback to HTML parsing
-        return self._parse_html(html)
-
-    def _extract_mosaic_data(self, html: str) -> list[dict]:
-        """Try to extract from Indeed's window.mosaic.providerData."""
-        jobs = []
-        # Indeed embeds job data in script tags
-        match = re.search(r'window\.mosaic\.providerData\["mosaic-provider-jobcards"\]\s*=\s*({.+?});\s*</script>', html, re.DOTALL)
-        if not match:
-            match = re.search(r'"jobCards"\s*:\s*(\[.+?\])', html, re.DOTALL)
-
-        if match:
-            try:
-                data = json.loads(match.group(1))
-                results = data.get("metaData", {}).get("mosaicProviderJobCardsModel", {}).get("results", [])
-                if not results and isinstance(data, list):
-                    results = data
-                for item in results:
-                    job = {"source": self.source_name}
-                    job["title"] = item.get("title", item.get("displayTitle", ""))
-                    job["company"] = item.get("company", item.get("companyName", ""))
-                    job["location"] = item.get("formattedLocation", item.get("jobLocationCity", ""))
-                    jk = item.get("jobkey", item.get("jk", ""))
-                    if jk:
-                        job["job_id"] = jk
-                        job["url"] = f"{BASE_URL}/viewjob?jk={jk}"
-
-                    sal = item.get("formattedSalarySnippet", item.get("salarySnippet", {}).get("text", ""))
-                    if sal:
-                        parsed = parse_salary(sal)
-                        job["salary_raw"] = parsed["raw"]
-                        job["salary_min"] = parsed["min"]
-                        job["salary_max"] = parsed["max"]
-                        job["salary_period"] = parsed["period"]
-
-                    job["snippet"] = clean_text(item.get("snippet", ""))[:500]
-                    job["date_posted"] = item.get("formattedRelativeTime", "")
-
-                    if job.get("title"):
-                        jobs.append(job)
-            except (json.JSONDecodeError, AttributeError, KeyError):
-                pass
-        return jobs
-
-    def _parse_html(self, html: str) -> tuple[list[dict], bool]:
-        """Fallback HTML parsing."""
-        soup = BeautifulSoup(html, "html.parser")
-        jobs = []
-
-        cards = (
-            soup.select('div[class*="job_seen_beacon"]')
-            or soup.select('div[class*="jobsearch-SerpJobCard"]')
-            or soup.select('div[data-jk]')
-            or soup.select('td[class*="resultContent"]')
-        )
-
-        for card in cards:
-            job = {"source": self.source_name}
-
-            title_el = (
-                card.select_one('h2 a')
-                or card.select_one('a[data-jk]')
-                or card.select_one('a[class*="title"]')
-            )
-            if not title_el:
-                title_span = card.select_one('h2 span') or card.select_one('[class*="jobTitle"] span')
-                if title_span:
-                    parent_a = title_span.find_parent("a")
-                    if parent_a:
-                        title_el = parent_a
-
-            if not title_el:
-                continue
-
-            job["title"] = clean_text(title_el.get_text())
-            href = title_el.get("href", "")
-            job["url"] = urljoin(BASE_URL, href)
-
-            jk = title_el.get("data-jk", "") or card.get("data-jk", "")
-            if jk:
-                job["job_id"] = jk
-
-            el = card.select_one('[data-testid="company-name"]') or card.select_one('[class*="companyName"]')
-            if el:
-                job["company"] = clean_text(el.get_text())
-
-            el = card.select_one('[data-testid="text-location"]') or card.select_one('[class*="companyLocation"]')
-            if el:
-                job["location"] = clean_text(el.get_text())
-
-            el = card.select_one('[class*="salary-snippet"]') or card.select_one('[class*="salaryText"]')
-            if el:
-                sal = parse_salary(el.get_text())
-                job["salary_raw"] = sal["raw"]
-                job["salary_min"] = sal["min"]
-                job["salary_max"] = sal["max"]
-                job["salary_period"] = sal["period"]
-
-            el = card.select_one('[class*="job-snippet"]')
-            if el:
-                job["snippet"] = clean_text(el.get_text())[:500]
-
-            if job.get("title"):
-                jobs.append(job)
-
-        has_next = bool(soup.select_one('a[aria-label="Next Page"]'))
-        return jobs, has_next
-
-
-class IndeedScraper(IndeedUKScraper):
-    """Configurable Indeed scraper for any country variant."""
-
-    def __init__(self, client, delay: float = 1.5, base_url: str = "https://www.indeed.com", source: str = "indeed.com", **kwargs):
-        super().__init__(client, delay, **kwargs)
-        self._base_url = base_url
+        self.base_url = base_url
         self._source = source
+        self.default_currency = currency
 
     @property
     def source_name(self) -> str:
         return self._source
 
-    def _build_url(self, keyword: str, location: str, job_type: str,
-                   salary_min: int | None, start: int = 0) -> str:
-        params = [
-            f"q={quote_plus(keyword)}",
-            f"l={quote_plus(location)}",
-            "sort=date",
-        ]
-        if start > 0:
-            params.append(f"start={start}")
-        indeed_type = JOB_TYPE_MAP.get(job_type, "")
-        if indeed_type:
-            params.append(f"jt={indeed_type}")
+    def _build_url(self, keyword, location, job_type, salary_min, page) -> str:
+        params = [f"q={quote_plus(keyword)}", f"l={quote_plus(location)}", "sort=date"]
+        if page > 1:
+            params.append(f"start={(page - 1) * 10}")
+        if job_type in JOB_TYPE_PARAM:
+            params.append(f"jt={JOB_TYPE_PARAM[job_type]}")
         if salary_min:
-            params.append(f"salary={salary_min}")
-        return f"{self._base_url}/jobs?" + "&".join(params)
+            params.append(f"salary={int(salary_min)}")
+        return f"{self.base_url}/jobs?" + "&".join(params)
+
+    def _parse_search(self, html: str, soup: BeautifulSoup) -> tuple[list[dict], bool]:
+        jobs = self._extract_mosaic(html)
+        if not jobs:
+            jobs = self._extract_jsonld_jobs(soup)
+        if not jobs:
+            jobs = self._parse_cards(soup)
+        has_next = bool(soup.select_one('a[aria-label="Next Page"], a[data-testid="pagination-page-next"]')) or len(jobs) >= 10
+        return jobs, has_next and bool(jobs)
+
+    def _extract_mosaic(self, html: str) -> list[dict]:
+        data = _json_after(html, _MOSAIC_MARK)
+        if data is None:
+            data = _json_after(html, _JOBCARDS_MARK)
+        if not data:
+            return []
+        results = data if isinstance(data, list) else (
+            ((data.get("metaData") or {}).get("mosaicProviderJobCardsModel") or {}).get("results") or [])
+        jobs = []
+        for it in results:
+            if not isinstance(it, dict):
+                continue
+            title = clean_text(it.get("title") or it.get("displayTitle"))
+            if not title:
+                continue
+            jk = it.get("jobkey") or it.get("jk") or ""
+            job = {
+                "source": self.source_name, "title": title,
+                "company": clean_text(it.get("company") or it.get("companyName")),
+                "location": clean_text(it.get("formattedLocation") or it.get("jobLocationCity")),
+                "job_id": jk, "url": f"{self.base_url}/viewjob?jk={jk}" if jk else "",
+                "snippet": clean_text(re.sub(r"<[^>]+>", " ", it.get("snippet") or ""))[:500],
+                # pubDate is epoch milliseconds; normalize_date handles ms, but
+                # keep the readable relative text as the fallback.
+                "date_posted": it.get("pubDate") or it.get("formattedRelativeTime") or "",
+            }
+            sal = it.get("formattedSalarySnippet") or (it.get("salarySnippet") or {}).get("text") or ""
+            est = it.get("extractedSalary") or {}
+            if isinstance(est, dict) and est.get("min"):
+                period = {"yearly": "annum", "monthly": "month", "weekly": "week", "daily": "day", "hourly": "hour"}.get(
+                    str(est.get("type", "yearly")).lower(), "annum")
+                apply_salary(job, {"raw": sal or f"{est['min']} - {est.get('max', est['min'])} per {period}",
+                                   "min": float(est["min"]), "max": float(est.get("max") or est["min"]),
+                                   "currency": self.default_currency, "period": period})
+            elif sal:
+                apply_salary(job, parse_salary(sal, self.default_currency))
+            types = it.get("jobTypes") or []
+            job["employment_type"] = detect_employment_type(" ".join(map(str, types)) if types else job["snippet"])
+            job["work_mode"] = "Remote" if it.get("remoteLocation") else detect_work_mode(job["location"], job["snippet"])
+            jobs.append(job)
+        return jobs
+
+    def _parse_cards(self, soup: BeautifulSoup) -> list[dict]:
+        jobs = []
+        cards = soup.select("div.job_seen_beacon, div[data-jk], li div[class*='cardOutline']")
+        for card in cards:
+            a = card.select_one("h2 a, a[data-jk], a[class*='jcs-JobTitle']")
+            if not a:
+                continue
+            job = {"source": self.source_name, "title": clean_text(a.get_text()),
+                   "url": strip_tracking(urljoin(self.base_url, a.get("href", "")))}
+            jk = a.get("data-jk") or card.get("data-jk") or ""
+            if jk:
+                job["job_id"] = jk
+                job["url"] = f"{self.base_url}/viewjob?jk={jk}"
+            el = card.select_one('[data-testid="company-name"], [class*="companyName"]')
+            job["company"] = clean_text(el.get_text()) if el else ""
+            el = card.select_one('[data-testid="text-location"], [class*="companyLocation"]')
+            job["location"] = clean_text(el.get_text()) if el else ""
+            el = card.select_one('[class*="salary-snippet"], [class*="salaryText"], [data-testid="attribute_snippet_testid"]')
+            if el:
+                apply_salary(job, parse_salary(el.get_text(), self.default_currency))
+            el = card.select_one('[class*="job-snippet"], [data-testid="jobsnippet_footer"]')
+            job["snippet"] = clean_text(el.get_text(" ")) [:500] if el else ""
+            el = card.select_one('[data-testid="myJobsStateDate"], span.date')
+            job["date_posted"] = clean_text(el.get_text()) if el else ""
+            job["work_mode"] = detect_work_mode(job["location"], job["snippet"])
+            job["employment_type"] = detect_employment_type(job["snippet"])
+            jobs.append(job)
+        return jobs
+
+
+class IndeedUKScraper(IndeedScraper):
+    def __init__(self, client, delay: float = 1.5, **kwargs):
+        super().__init__(client, delay, base_url="https://uk.indeed.com", source="indeed.co.uk", currency="GBP", **kwargs)

@@ -1,0 +1,11 @@
+.git
+.gitignore
+__pycache__
+**/__pycache__
+*.pyc
+storage
+*.md
+!README.md
+*.jpg
+*.png
+.venv

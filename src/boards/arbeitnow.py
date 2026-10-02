@@ -1,87 +1,86 @@
-"""Arbeitnow.com scraper — free JSON API for EU and remote jobs."""
+"""Arbeitnow.com via its public JSON API (EU + remote, mostly DACH).
 
-from urllib.parse import quote_plus
+The API has no search parameters: each page is ~2.5 MB of unfiltered
+listings, so we filter client-side on keyword tokens and cap the page count.
+"""
+
+from __future__ import annotations
+
+import re
 
 from apify import Actor
 
-from ..utils import BaseScraper, clean_text, parse_salary
-
+from ..utils import BaseScraper, clean_text, detect_work_mode
+from .remoteok import keyword_tokens
 
 API_URL = "https://www.arbeitnow.com/api/job-board-api"
 
 
 class ArbeitnowScraper(BaseScraper):
+    default_currency = "EUR"
+    max_pages = 6
+    hard_page_cap = 6
 
     @property
     def source_name(self) -> str:
         return "arbeitnow.com"
 
-    async def search(self, keyword: str, location: str, max_results: int = 50,
-                     job_type: str = "all", salary_min: int | None = None) -> list[dict]:
-        all_jobs = []
-        page = 1
-
-        while len(all_jobs) < max_results:
-            url = f"{API_URL}?page={page}"
-            Actor.log.info(f"[Arbeitnow] Fetching API page {page}")
-
-            data = await self._fetch_json(url)
+    async def search(self, keyword, location, max_results=50, job_type="all", salary_min=None) -> list[dict]:
+        self.stats["mode"] = "api"
+        toks = keyword_tokens(keyword)
+        loc = (location or "").lower().strip()
+        want_remote = loc in ("", "remote")
+        all_jobs: list[dict] = []
+        if self.exhausted:
+            return all_jobs
+        page = self._page
+        while len(all_jobs) < max_results and page <= self.max_pages:
+            data = await self._fetch_json(f"{API_URL}?page={page}")
             if not data:
+                self.exhausted = True
                 break
-
-            items = data.get("data", [])
+            items = data.get("data") or []
             if not items:
-                Actor.log.info(f"[Arbeitnow] No results on page {page}, stopping.")
+                self.exhausted = True
                 break
-
-            keyword_lower = keyword.lower()
-            location_lower = location.lower()
-
-            for item in items:
-                if len(all_jobs) >= max_results:
-                    break
-
-                title = item.get("title", "")
-                item_location = item.get("location", "")
-                description = item.get("description", "")
-
-                # Client-side keyword + location filter (API doesn't support search params)
-                searchable = f"{title} {description} {item.get('tags', '')}".lower()
-                if keyword_lower not in searchable:
+            fresh = []
+            for it in items:
+                title = it.get("title", "")
+                desc = it.get("description", "") or ""
+                tags = it.get("tags") or []
+                hay = f"{title} {desc} {' '.join(tags)}".lower()
+                if not all(t in hay for t in toks):
                     continue
-
-                if location_lower and location_lower != "remote":
-                    loc_searchable = f"{item_location} {item.get('remote', '')}".lower()
-                    if location_lower not in loc_searchable and "remote" not in loc_searchable:
-                        continue
-
-                tags = item.get("tags", [])
-                if isinstance(tags, list):
-                    tags = ", ".join(tags[:5])
-
-                all_jobs.append({
-                    "title": clean_text(title),
-                    "company": item.get("company_name", ""),
-                    "location": item_location or "Remote",
-                    "salary_raw": "",
-                    "salary_min": None,
-                    "salary_max": None,
-                    "salary_period": "annum",
-                    "snippet": clean_text(description)[:500],
-                    "date_posted": item.get("created_at", ""),
-                    "url": item.get("url", ""),
-                    "job_id": str(item.get("slug", "")),
+                item_loc = (it.get("location") or "").lower()
+                is_remote = bool(it.get("remote"))
+                if not want_remote and loc not in item_loc and not is_remote:
+                    continue
+                job_types = it.get("job_types") or []
+                fresh.append({
                     "source": self.source_name,
-                    "employment_type": item.get("job_types", [""])[0] if item.get("job_types") else "",
-                    "category": tags if isinstance(tags, str) else "",
+                    "title": clean_text(title),
+                    "company": clean_text(it.get("company_name", "")),
+                    "location": clean_text(it.get("location") or "Remote"),
+                    "snippet": clean_text(re.sub(r"<[^>]+>", " ", desc))[:500],
+                    "date_posted": it.get("created_at", ""),
+                    "url": it.get("url", ""),
+                    "job_id": str(it.get("slug", "")),
+                    "employment_type": clean_text(job_types[0]) if job_types else "",
+                    "category": ", ".join(tags[:5]),
+                    "work_mode": "Remote" if is_remote else detect_work_mode(title, desc[:300]),
+                    "salary_currency": "EUR",
                 })
-
-            # Check for next page
-            if not data.get("links", {}).get("next"):
-                break
-
+            all_jobs.extend(fresh)
+            self.stats["pages"] += 1
+            self.stats["jobs"] += len(fresh)
+            Actor.log.info(f"[Arbeitnow] page {page}: +{len(fresh)} (run total {self.stats['jobs']})")
+            if self.on_page and fresh:
+                await self.on_page(self.source_name, fresh)
             page += 1
-            await self._polite_delay()
-
-        Actor.log.info(f"[Arbeitnow] Total scraped: {len(all_jobs)}")
+            self._page = page
+            if not (data.get("links") or {}).get("next"):
+                self.exhausted = True
+                break
+        if self.hard_page_cap and page > self.hard_page_cap:
+            self.exhausted = True
         return all_jobs
