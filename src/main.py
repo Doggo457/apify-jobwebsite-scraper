@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import random
 import re
 import statistics
@@ -419,10 +420,18 @@ async def main() -> None:
 
         selected_boards = [b for b in (actor_input.get("boards") or COUNTRY_DEFAULTS.get(country, COUNTRY_DEFAULTS["uk"]))
                            if b in BOARD_REGISTRY]
-        adzuna_app_id = actor_input.get("adzuna_app_id") or ""
-        adzuna_app_key = actor_input.get("adzuna_app_key") or ""
-        usajobs_api_key = actor_input.get("usajobs_api_key") or ""
-        usajobs_email = actor_input.get("usajobs_email") or ""
+        # API keys: the run input wins; otherwise fall back to the Actor's own
+        # secret environment variables (Console > Actor > Settings > Environment
+        # variables) so published tasks can use Adzuna / USAJobs without the
+        # keys appearing in a public task input.
+        adzuna_app_id = (actor_input.get("adzuna_app_id") or os.environ.get("ADZUNA_APP_ID") or "").strip()
+        adzuna_app_key = (actor_input.get("adzuna_app_key") or os.environ.get("ADZUNA_APP_KEY") or "").strip()
+        usajobs_api_key = (actor_input.get("usajobs_api_key") or os.environ.get("USAJOBS_API_KEY") or "").strip()
+        usajobs_email = (actor_input.get("usajobs_email") or os.environ.get("USAJOBS_EMAIL") or "").strip()
+        if adzuna_app_id and adzuna_app_key and not actor_input.get("adzuna_app_key"):
+            Actor.log.info("Adzuna: using the Actor's own API credentials (environment)")
+        if usajobs_api_key and not actor_input.get("usajobs_api_key"):
+            Actor.log.info("USAJobs: using the Actor's own API key (environment)")
         reed_api_key = (actor_input.get("reed_api_key") or "").strip()
 
         if not selected_boards:

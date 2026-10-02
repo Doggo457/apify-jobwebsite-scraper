@@ -161,8 +161,8 @@ Export your results as **JSON, CSV, or Excel** directly from the Apify dashboard
 | **Incremental Mode** | Off | For scheduled runs — return only jobs not seen in previous runs of the same search |
 | **Salary Benchmarks** | Off | Output salary summary statistics per role/location |
 | **Reed API Key** | — | Optional. Reads Reed through its official JSON API: 100 results per request, full descriptions, never blocked, no proxy |
-| **Adzuna App ID / Key** | — | Free API credentials to enable the Adzuna board |
-| **USAJobs API Key / Email** | — | Free API credentials to enable the USAJobs board |
+| **Adzuna App ID / Key** | — | Free API credentials to enable the Adzuna board. Leave empty to use the Actor's own credentials when the operator has set `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` as Actor environment variables |
+| **USAJobs API Key / Email** | — | Free API credentials to enable the USAJobs board. Leave empty to use the Actor's own key when the operator has set `USAJOBS_API_KEY` / `USAJOBS_EMAIL` as Actor environment variables |
 | **Max pages per board** | 40 | Hard cap on search pages fetched per board and term; mainly bounds Unlimited Mode |
 | **Proxy** | Residential | Residential (recommended), Datacenter (cheaper, more blocks) or None. API boards never use a proxy |
 
